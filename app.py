@@ -294,7 +294,32 @@ def index():
 @app.route("/api/health", methods=["GET"])
 def health_check():
     from datetime import datetime, timezone
-    return jsonify({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
+    import http.cookiejar
+
+    # Cookie diagnosis
+    render_path = "/etc/secrets/cookies.txt"
+    local_path = os.path.join(BASE_DIR, "cookies.txt")
+    cookie_info = {
+        "render_path_exists": os.path.exists(render_path),
+        "local_path_exists": os.path.exists(local_path),
+        "active_path": render_path if os.path.exists(render_path) else local_path,
+        "active_path_exists": os.path.exists(render_path) or os.path.exists(local_path),
+        "cookies_loaded": 0,
+    }
+    active = cookie_info["active_path"]
+    if os.path.exists(active):
+        try:
+            jar = http.cookiejar.MozillaCookieJar(active)
+            jar.load(ignore_discard=True, ignore_expires=True)
+            cookie_info["cookies_loaded"] = len(jar)
+        except Exception as e:
+            cookie_info["cookie_error"] = str(e)
+
+    return jsonify({
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "cookie_status": cookie_info,
+    })
 
 
 @app.route("/api/summarize", methods=["POST"])
