@@ -440,33 +440,30 @@ def summarize():
                 "video_id": video_id,
             })
 
-    # Process valid videos concurrently
+    # Process videos sequentially with a small delay to respect Supadata rate limits.
+    # (Concurrent requests to Supadata's free tier get rate-limited, causing failures.)
+    import time
     results = []
     valid_tasks = [t for t in tasks if "video_id" in t]
     invalid_tasks = [t for t in tasks if "error" in t]
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        future_map = {}
-        for task in valid_tasks:
-            future = executor.submit(
-                process_single_video,
+    for i, task in enumerate(valid_tasks):
+        try:
+            result = process_single_video(
                 task["video_id"],
                 task["url"],
                 gemini_key,
             )
-            future_map[future] = task
-
-        for future in as_completed(future_map):
-            task = future_map[future]
-            try:
-                result = future.result()
-                results.append(result)
-            except Exception as e:
-                results.append({
-                    "url": task["url"],
-                    "video_id": task["video_id"],
-                    "error": str(e),
-                })
+            results.append(result)
+        except Exception as e:
+            results.append({
+                "url": task["url"],
+                "video_id": task["video_id"],
+                "error": str(e),
+            })
+        # Small delay between requests to avoid rate limits (skip after last)
+        if i < len(valid_tasks) - 1:
+            time.sleep(1.5)
 
     # Add invalid URL errors
     for t in invalid_tasks:
