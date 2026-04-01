@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube Summarizer — AI-Powered Video Summaries</title>
+    <meta name="description" content="Summarize YouTube videos instantly with AI. Enter up to 5 URLs and get concise summaries alongside full transcriptions.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Animated background particles -->
+    <div class="bg-particles" id="bgParticles"></div>
+
+    <!-- Header -->
+    <header class="app-header">
+        <div class="header-content">
+            <div class="logo-group">
+                <div class="logo-icon">
+                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none">
+                        <rect width="24" height="24" rx="6" fill="url(#logoGrad)"/>
+                        <path d="M9.5 7.5v9l7-4.5-7-4.5z" fill="white"/>
+                        <defs>
+                            <linearGradient id="logoGrad" x1="0" y1="0" x2="24" y2="24">
+                                <stop stop-color="#ff6b6b"/>
+                                <stop offset="1" stop-color="#ee5a24"/>
+                            </linearGradient>
+                        </defs>
+                    </svg>
+                </div>
+                <h1 class="app-title">YouTube<span class="title-accent">Summarizer</span></h1>
+            </div>
+            <button class="settings-btn" id="settingsBtn" title="API Settings">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="3"/>
+                    <path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                </svg>
+            </button>
+        </div>
+    </header>
+
+    <!-- Settings Modal -->
+    <div class="modal-overlay" id="settingsModal">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h2>⚙️ API Settings</h2>
+                <button class="modal-close" id="closeSettings">&times;</button>
+            </div>
+            <div class="modal-body">
+                <label for="apiKeyInput" class="input-label">Google Gemini API Key</label>
+                <div class="api-key-wrapper">
+                    <input type="password" id="apiKeyInput" class="api-key-input" placeholder="Enter your Gemini API key..." autocomplete="off">
+                    <button class="toggle-visibility" id="toggleKeyVisibility" title="Toggle visibility">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                            <circle cx="12" cy="12" r="3"/>
+                        </svg>
+                    </button>
+                </div>
+                <p class="input-hint">Your key is stored locally in your browser and never shared.</p>
+                <button class="save-key-btn" id="saveKeyBtn">Save Key</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <main class="main-content">
+        <!-- URL Input Section -->
+        <section class="input-section">
+            <div class="section-header">
+                <h2 class="section-title">Enter YouTube URLs</h2>
+                <p class="section-subtitle">Add up to 5 video URLs to summarize</p>
+            </div>
+            <div class="url-inputs-container" id="urlInputs">
+                <div class="url-input-row" data-index="0">
+                    <span class="url-index">1</span>
+                    <input type="url" class="url-input" placeholder="https://www.youtube.com/watch?v=..." data-index="0">
+                    <button class="clear-url-btn" title="Clear" data-index="0">&times;</button>
+                </div>
+                <div class="url-input-row" data-index="1">
+                    <span class="url-index">2</span>
+                    <input type="url" class="url-input" placeholder="https://www.youtube.com/watch?v=..." data-index="1">
+                    <button class="clear-url-btn" title="Clear" data-index="1">&times;</button>
+                </div>
+                <div class="url-input-row" data-index="2">
+                    <span class="url-index">3</span>
+                    <input type="url" class="url-input" placeholder="https://www.youtube.com/watch?v=..." data-index="2">
+                    <button class="clear-url-btn" title="Clear" data-index="2">&times;</button>
+                </div>
+                <div class="url-input-row" data-index="3">
+                    <span class="url-index">4</span>
+                    <input type="url" class="url-input" placeholder="https://www.youtube.com/watch?v=..." data-index="3">
+                    <button class="clear-url-btn" title="Clear" data-index="3">&times;</button>
+                </div>
+                <div class="url-input-row" data-index="4">
+                    <span class="url-index">5</span>
+                    <input type="url" class="url-input" placeholder="https://www.youtube.com/watch?v=..." data-index="4">
+                    <button class="clear-url-btn" title="Clear" data-index="4">&times;</button>
+                </div>
+            </div>
+            <div class="action-bar">
+                <span class="url-count" id="urlCount">0 / 5 URLs entered</span>
+                <button class="summarize-btn" id="summarizeBtn" disabled>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+                    </svg>
+                    <span>Summarize Videos</span>
+                </button>
+            </div>
+        </section>
+
+        <!-- Loading State -->
+        <section class="loading-section" id="loadingSection" style="display: none;">
+            <div class="loading-card">
+                <div class="loading-spinner"></div>
+                <h3 class="loading-title">Processing your videos...</h3>
+                <p class="loading-subtitle" id="loadingText">Fetching transcripts and generating summaries</p>
+                <div class="loading-progress">
+                    <div class="progress-bar" id="progressBar"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Results Section -->
+        <section class="results-section" id="resultsSection" style="display: none;">
+            <div class="results-header">
+                <h2 class="section-title">📊 Results</h2>
+                <div class="results-actions">
+                    <button class="download-all-btn" id="downloadAllBtn" title="Download all summaries and transcripts">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                            <polyline points="7 10 12 15 17 10"/>
+                            <line x1="12" y1="15" x2="12" y2="3"/>
+                        </svg>
+                        Download All
+                    </button>
+                    <button class="new-batch-btn" id="newBatchBtn">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 5v14M5 12h14"/>
+                        </svg>
+                        New Batch
+                    </button>
+                </div>
+            </div>
+            <div class="results-container" id="resultsContainer"></div>
+        </section>
+    </main>
+
+    <!-- Footer -->
+    <footer class="app-footer">
+        <p>Built with ❤️ using Gemini AI &bull; Transcripts powered by YouTube</p>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>

@@ -1,0 +1,27 @@
+# Python logic
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+env.bak/
+venv.bak/
+
+# Local configuration
+.env
+.flaskenv
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
+
+# Sensitive
+cookies.txt
+
+# Temporary outputs
+test_*.py
+time_test.py
