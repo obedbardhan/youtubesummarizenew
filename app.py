@@ -77,7 +77,12 @@ def fetch_transcript(video_id: str) -> dict:
     try:
         import http.cookiejar
         session = requests.Session()
-        cookie_file = os.path.join(BASE_DIR, "cookies.txt")
+
+        # Check Render Secret File path first, then local path
+        render_cookie_path = "/etc/secrets/cookies.txt"
+        local_cookie_path = os.path.join(BASE_DIR, "cookies.txt")
+        cookie_file = render_cookie_path if os.path.exists(render_cookie_path) else local_cookie_path
+
         debug_info["cookie_path"] = cookie_file
         debug_info["cookie_exists"] = os.path.exists(cookie_file)
 
