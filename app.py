@@ -54,11 +54,7 @@ def fetch_video_metadata(video_id: str) -> dict:
     """Fetch video title and thumbnail via oembed (no API key needed)."""
     try:
         oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
-        }
-        resp = requests.get(oembed_url, timeout=10, headers=headers)
+        resp = requests.get(oembed_url, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             return {
@@ -79,21 +75,16 @@ def fetch_transcript(video_id: str) -> dict:
     """Fetch transcript for a YouTube video and ensure it is in English.
     
     Uses a multi-tier strategy:
-    1. Direct English fetch with browser headers.
-    2. List available transcripts and translate the best candidate (e.g. Hindi) to English.
-    3. Fallback to any available transcript and rely on Gemini for translation.
+    1. Direct English fetch.
+    2. List available transcripts and translate the best candidate to English.
+    3. Fallback to any available transcript.
     """
     debug_info = {}
     try:
         import http.cookiejar
         session = requests.Session()
         
-        # Browser-like headers to bypass anti-bot measures on cloud IPs
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        })
-
+        # Standard session handling - cookies will be added below if available
         cookie_file = os.path.join(BASE_DIR, "cookies.txt")
         debug_info["cookie_path"] = cookie_file
         debug_info["cookie_exists"] = os.path.exists(cookie_file)
@@ -113,7 +104,8 @@ def fetch_transcript(video_id: str) -> dict:
 
         # ── Strategy 1: Try fetching English directly (preferred) ──
         try:
-            fetched = ytt_api.fetch(video_id, languages=["en", "en-US", "en-GB", "en-IN"])
+            # We try 'en' first as it is the most common requirement
+            fetched = ytt_api.fetch(video_id, languages=["en", "en-US", "en-GB"])
             detected_language = "English"
         except Exception:
             pass
@@ -123,21 +115,15 @@ def fetch_transcript(video_id: str) -> dict:
             try:
                 transcript_list = ytt_api.list(video_id)
                 
-                # Check for English first in the list
-                try:
-                    t = transcript_list.find_transcript(["en", "en-US", "en-GB", "en-IN"])
-                    fetched = t.fetch()
-                    detected_language = "English"
-                except:
-                    # If no native English, try translating any available transcript to English
-                    for t in transcript_list:
-                        if t.is_translatable:
-                            try:
-                                fetched = t.translate("en").fetch()
-                                detected_language = f"Translated to English (from {t.language_code})"
-                                break
-                            except:
-                                continue
+                # Try to translate any available transcript to English
+                for t in transcript_list:
+                    if t.is_translatable:
+                        try:
+                            fetched = t.translate("en").fetch()
+                            detected_language = f"Translated to English (from {t.language_code})"
+                            break
+                        except:
+                            continue
                 
                 # Final fallback: just get whichever transcript is available (even if not in English/translatable)
                 if fetched is None:
@@ -148,7 +134,6 @@ def fetch_transcript(video_id: str) -> dict:
                             break
                         except:
                             continue
-
             except Exception as e:
                 debug_info["list_error"] = str(e)
 
