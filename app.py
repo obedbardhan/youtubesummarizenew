@@ -11,12 +11,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
-# Force IPv4 to bypass severe IPv6 DNS routing timeouts on local macOS DEV environments only.
-# Render natively handles IPv6 seamlessly.
-if not os.environ.get("RENDER"):
-    def allowed_gai_family():
-        return socket.AF_INET
-    urllib3_cn.allowed_gai_family = allowed_gai_family
+# Force IPv4 globally to bypass severe IPv6 DNS routing timeouts and cloud-provider blocks.
+def allowed_gai_family():
+    return socket.AF_INET
+urllib3_cn.allowed_gai_family = allowed_gai_family
 
 from youtube_transcript_api import YouTubeTranscriptApi
 
@@ -54,7 +52,13 @@ def fetch_video_metadata(video_id: str) -> dict:
     """Fetch video title and thumbnail via oembed (no API key needed)."""
     try:
         oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
-        resp = requests.get(oembed_url, timeout=10)
+        headers = {}
+        if os.environ.get("RENDER"):
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+        resp = requests.get(oembed_url, timeout=10, headers=headers)
         if resp.status_code == 200:
             data = resp.json()
             return {
@@ -82,9 +86,20 @@ def fetch_transcript(video_id: str) -> dict:
     debug_info = {}
     try:
         import http.cookiejar
+        import time
+        import random
+        
         session = requests.Session()
         
-        # Standard session handling - cookies will be added below if available
+        # Apply stealth headers conditionally on Render only
+        if os.environ.get("RENDER"):
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            })
+            # Randomized delay to bypass cloud-IP anti-bot detection
+            time.sleep(random.uniform(0.5, 1.5))
+
         cookie_file = os.path.join(BASE_DIR, "cookies.txt")
         debug_info["cookie_path"] = cookie_file
         debug_info["cookie_exists"] = os.path.exists(cookie_file)
