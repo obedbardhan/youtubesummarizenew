@@ -5,13 +5,14 @@ import re
 import sys
 import json
 import socket
+import html
 import requests
 import urllib3.util.connection as urllib3_cn
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
-# Force IPv4 globally to bypass severe IPv6 DNS routing timeouts and cloud-provider blocks.
+# Force IPv4 to bypass severe IPv6 DNS routing timeouts and avoids cloud IPv6 bans.
 def allowed_gai_family():
     return socket.AF_INET
 urllib3_cn.allowed_gai_family = allowed_gai_family
@@ -52,13 +53,7 @@ def fetch_video_metadata(video_id: str) -> dict:
     """Fetch video title and thumbnail via oembed (no API key needed)."""
     try:
         oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
-        headers = {}
-        if os.environ.get("RENDER"):
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Accept-Language": "en-US,en;q=0.9",
-            }
-        resp = requests.get(oembed_url, timeout=10, headers=headers)
+        resp = requests.get(oembed_url, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             return {
@@ -75,123 +70,217 @@ def fetch_video_metadata(video_id: str) -> dict:
     }
 
 
+def _build_session_with_cookies() -> requests.Session:
+    """Build a requests session with cookies loaded (if available) and realistic browser headers."""
+    import http.cookiejar
+    session = requests.Session()
+
+    # Realistic browser headers to avoid simple bot detection
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+        "Cache-Control": "max-age=0",
+        "Sec-Ch-Ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1"
+    })
+
+    # Load cookies if available
+    render_cookie_path = "/etc/secrets/cookies.txt"
+    local_cookie_path = os.path.join(BASE_DIR, "cookies.txt")
+    cookie_file = render_cookie_path if os.path.exists(render_cookie_path) else local_cookie_path
+
+    if os.path.exists(cookie_file):
+        try:
+            jar = http.cookiejar.MozillaCookieJar(cookie_file)
+            jar.load(ignore_discard=True, ignore_expires=True)
+            session.cookies.update(jar)
+        except Exception as e:
+            print(f"⚠️  Cookie load warning: {e}")
+
+    return session
+
+
+def _try_fetch_transcript(ytt_api, video_id: str):
+    """Attempt to fetch transcript using multiple language strategies."""
+    # Try English then Hindi
+    try:
+        return ytt_api.fetch(video_id, languages=["en", "hi"])
+    except Exception:
+        pass
+
+    # Try listing available transcripts and translating
+    try:
+        transcript_list = ytt_api.list(video_id)
+        for t in transcript_list:
+            try:
+                return t.translate("en").fetch()
+            except Exception:
+                continue
+        # Last resort: any language
+        for t in transcript_list:
+            try:
+                return t.fetch()
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return None
+
+
+def _try_manual_fetch_transcript(video_id: str, session: requests.Session) -> Optional[list]:
+    """Fallback: Manually extract transcript by parsing the YouTube page HTML.
+    This is extremely robust against simple library blocks.
+    """
+    try:
+        # Fetch the video page with same session/cookies as a real browser
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        resp = session.get(url, timeout=15)
+        if resp.status_code != 200:
+            return None
+
+        # Look for the internal JSON player response containing caption URLs
+        match = re.search(r'ytInitialPlayerResponse\s*=\s*({.*?});(?:</script>|\n)', resp.text, re.DOTALL)
+        if not match:
+            # Try a second common format for this data
+            match = re.search(r'var ytInitialPlayerResponse\s*=\s*({.*?});(?:</script>|\n)', resp.text, re.DOTALL)
+
+        if not match:
+            return None
+
+        data = json.loads(match.group(1))
+        captions = data.get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
+
+        if not captions:
+            return None
+
+        # Pick best track (English preferred, then Hindi)
+        target_track = next((t for t in captions if ".en" in t.get("vssId", "")), None)
+        if not target_track:
+            target_track = next((t for t in captions if ".hi" in t.get("vssId", "")), None)
+        if not target_track:
+            target_track = captions[0]
+
+        base_url = target_track.get("baseUrl")
+        if not base_url:
+            return None
+
+        # Fetch the raw XML transcript
+        xml_resp = session.get(base_url, timeout=10)
+        if xml_resp.status_code != 200:
+            return None
+
+        # Basic XML extraction of <text start="X" dur="Y">CONTENT</text>
+        # We don't need a heavy XML parser for this simple structure
+        segments = []
+        matches = re.finditer(r'<text start="([\d.]+)" dur="([\d.]+)".*?>(.*?)</text>', xml_resp.text)
+        for m in matches:
+            segments.append({
+                "start": float(m.group(1)),
+                "duration": float(m.group(2)),
+                "text": html.unescape(m.group(3))
+            })
+
+        # Mock the Dataclass object for _format_transcript
+        from collections import namedtuple
+        Snippet = namedtuple('Snippet', ['start', 'duration', 'text'])
+        return [Snippet(s['start'], s['duration'], s['text']) for s in segments]
+    except Exception as e:
+        print(f"Manual fetch failed: {e}")
+        return None
+
+
 def fetch_transcript(video_id: str) -> dict:
-    """Fetch transcript for a YouTube video and ensure it is in English.
-    
-    Uses a multi-tier strategy:
-    1. Direct English fetch.
-    2. List available transcripts and translate the best candidate to English.
-    3. Fallback to any available transcript.
+    """Fetch transcript using a custom multi-tier fallback strategy (No Supadata).
+
+    Tier 1: Manual Extraction (mimicking actual browser sequence)
+    Tier 2: youtube-transcript-api with cookies + browser headers
+    Tier 3: youtube-transcript-api plain
     """
     debug_info = {}
+    last_error = None
+
+    # Build session with cookies and stealth headers
+    session = _build_session_with_cookies()
+
+    # ── Tier 1: Manual Extraction ──
     try:
-        import http.cookiejar
-        import time
-        import random
-        
-        session = requests.Session()
-        
-        # Apply stealth headers conditionally on Render only
-        if os.environ.get("RENDER"):
-            session.headers.update({
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Accept-Language": "en-US,en;q=0.9",
-            })
-            # Randomized delay to bypass cloud-IP anti-bot detection
-            time.sleep(random.uniform(0.5, 1.5))
-
-        cookie_file = os.path.join(BASE_DIR, "cookies.txt")
-        debug_info["cookie_path"] = cookie_file
-        debug_info["cookie_exists"] = os.path.exists(cookie_file)
-        
-        if debug_info["cookie_exists"]:
-            try:
-                cookie_jar = http.cookiejar.MozillaCookieJar(cookie_file)
-                cookie_jar.load(ignore_discard=True, ignore_expires=True)
-                session.cookies.update(cookie_jar)
-                debug_info["cookies_loaded"] = len(cookie_jar)
-            except Exception as ce:
-                debug_info["cookie_load_error"] = str(ce)
-        
-        ytt_api = YouTubeTranscriptApi(http_client=session)
-        fetched = None
-        detected_language = None
-
-        # ── Strategy 1: Try fetching English directly (preferred) ──
-        try:
-            # We try 'en' first as it is the most common requirement
-            fetched = ytt_api.fetch(video_id, languages=["en", "en-US", "en-GB"])
-            detected_language = "English"
-        except Exception:
-            pass
-
-        # ── Strategy 2: List and translate ──
-        if fetched is None:
-            try:
-                transcript_list = ytt_api.list(video_id)
-                
-                # Try to translate any available transcript to English
-                for t in transcript_list:
-                    if t.is_translatable:
-                        try:
-                            fetched = t.translate("en").fetch()
-                            detected_language = f"Translated to English (from {t.language_code})"
-                            break
-                        except:
-                            continue
-                
-                # Final fallback: just get whichever transcript is available (even if not in English/translatable)
-                if fetched is None:
-                    for t in transcript_list:
-                        try:
-                            fetched = t.fetch()
-                            detected_language = f"Original: {t.language_code}"
-                            break
-                        except:
-                            continue
-            except Exception as e:
-                debug_info["list_error"] = str(e)
-
-        if fetched is None:
-            return {
-                "error": "No transcript available for this video.", 
-                "segments": [], 
-                "full_text": "",
-                "debug": debug_info
-            }
-
-        # Build timestamped segments from FetchedTranscriptSnippet dataclass objects
-        formatted_segments = []
-        for snippet in fetched:
-            start = snippet.start
-            text = snippet.text
-            duration = getattr(snippet, 'duration', 0)
-
-            minutes = int(start // 60)
-            seconds = int(start % 60)
-            timestamp = f"{minutes:02d}:{seconds:02d}"
-            formatted_segments.append({
-                "timestamp": timestamp,
-                "start": start,
-                "duration": duration,
-                "text": text,
-            })
-
-        # Build full text
-        full_text = " ".join(s["text"] for s in formatted_segments)
-
-        return {
-            "segments": formatted_segments,
-            "full_text": full_text,
-            "error": None,
-        }
-
+        fetched = _try_manual_fetch_transcript(video_id, session)
+        if fetched:
+            debug_info["method"] = "manual_extraction"
+            return _format_transcript(fetched, debug_info)
     except Exception as e:
-        return {
-            "error": f"Failed to fetch transcript: {str(e)}",
-            "segments": [],
-            "full_text": "",
-        }
+        debug_info["tier1_error"] = str(e)
+
+    # ── Tier 2: Library with auth ──
+    try:
+        ytt_api = YouTubeTranscriptApi(http_client=session)
+        fetched = _try_fetch_transcript(ytt_api, video_id)
+        if fetched:
+            debug_info["method"] = "yt_api_with_cookies"
+            return _format_transcript(fetched, debug_info)
+    except Exception as e:
+        last_error = e
+        debug_info["tier2_error"] = str(e)
+
+    # ── Tier 3: Library plain ──
+    try:
+        plain_session = requests.Session()
+        plain_session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        })
+        ytt_api = YouTubeTranscriptApi(http_client=plain_session)
+        fetched = _try_fetch_transcript(ytt_api, video_id)
+        if fetched:
+            debug_info["method"] = "yt_api_plain"
+            return _format_transcript(fetched, debug_info)
+    except Exception as e:
+        last_error = e
+        debug_info["tier3_error"] = str(e)
+
+    # All tiers failed
+    error_msg = str(last_error) if last_error else "No transcript available"
+    return {
+        "error": f"Cloud block or Disabled: {error_msg}",
+        "segments": [],
+        "full_text": "",
+        "debug": debug_info,
+    }
+
+
+def _format_transcript(fetched, debug_info: dict) -> dict:
+    """Format fetched transcript snippets into structured output."""
+    formatted_segments = []
+    for snippet in fetched:
+        start = snippet.start
+        text = snippet.text
+        duration = snippet.duration
+
+        minutes = int(start // 60)
+        seconds = int(start % 60)
+        timestamp = f"{minutes:02d}:{seconds:02d}"
+        formatted_segments.append({
+            "timestamp": timestamp,
+            "start": start,
+            "duration": duration,
+            "text": text,
+        })
+
+    full_text = " ".join(s["text"] for s in formatted_segments)
+
+    return {
+        "segments": formatted_segments,
+        "full_text": full_text,
+        "error": None,
+        "debug": debug_info,
+    }
 
 
 def get_best_model(gemini_key: str) -> str:
@@ -213,7 +302,7 @@ def get_best_model(gemini_key: str) -> str:
         print(f"Could not list models: {e}")
 
     # Fallback list
-    return "gemini-2.5-flash-preview-04-17"
+    return "gemini-1.5-flash"
 
 
 # Cache the detected model name per API key
@@ -242,8 +331,7 @@ def summarize_transcript(gemini_key: str, title: str, full_text: str) -> str:
     if len(full_text) > max_chars:
         text_to_summarize += "\n\n[Transcript truncated for summarization]"
 
-    prompt = f"""You are an expert content analyst. Summarize the following YouTube video transcript.
-The transcript may be in English or another language (like Hindi), but you MUST always provide the summary in English.
+    prompt = f"""You are an expert content analyst. Summarize the following YouTube video transcript into a clear, well-structured summary.
 
 Video Title: "{title}"
 
@@ -316,7 +404,32 @@ def index():
 @app.route("/api/health", methods=["GET"])
 def health_check():
     from datetime import datetime, timezone
-    return jsonify({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
+    import http.cookiejar
+
+    # Cookie diagnosis
+    render_path = "/etc/secrets/cookies.txt"
+    local_path = os.path.join(BASE_DIR, "cookies.txt")
+    cookie_info = {
+        "render_path_exists": os.path.exists(render_path),
+        "local_path_exists": os.path.exists(local_path),
+        "active_path": render_path if os.path.exists(render_path) else local_path,
+        "active_path_exists": os.path.exists(render_path) or os.path.exists(local_path),
+        "cookies_loaded": 0,
+    }
+    active = cookie_info["active_path"]
+    if os.path.exists(active):
+        try:
+            jar = http.cookiejar.MozillaCookieJar(active)
+            jar.load(ignore_discard=True, ignore_expires=True)
+            cookie_info["cookies_loaded"] = len(jar)
+        except Exception as e:
+            cookie_info["cookie_error"] = str(e)
+
+    return jsonify({
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "cookie_status": cookie_info,
+    })
 
 
 @app.route("/api/summarize", methods=["POST"])
@@ -353,33 +466,30 @@ def summarize():
                 "video_id": video_id,
             })
 
-    # Process valid videos concurrently
+    # Process videos sequentially with a small delay to respect Supadata rate limits.
+    # (Concurrent requests to Supadata's free tier get rate-limited, causing failures.)
+    import time
     results = []
     valid_tasks = [t for t in tasks if "video_id" in t]
     invalid_tasks = [t for t in tasks if "error" in t]
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        future_map = {}
-        for task in valid_tasks:
-            future = executor.submit(
-                process_single_video,
+    for i, task in enumerate(valid_tasks):
+        try:
+            result = process_single_video(
                 task["video_id"],
                 task["url"],
                 gemini_key,
             )
-            future_map[future] = task
-
-        for future in as_completed(future_map):
-            task = future_map[future]
-            try:
-                result = future.result()
-                results.append(result)
-            except Exception as e:
-                results.append({
-                    "url": task["url"],
-                    "video_id": task["video_id"],
-                    "error": str(e),
-                })
+            results.append(result)
+        except Exception as e:
+            results.append({
+                "url": task["url"],
+                "video_id": task["video_id"],
+                "error": str(e),
+            })
+        # Small delay between requests to avoid rate limits (skip after last)
+        if i < len(valid_tasks) - 1:
+            time.sleep(1.5)
 
     # Add invalid URL errors
     for t in invalid_tasks:
@@ -398,5 +508,9 @@ def summarize():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8082))
     is_dev = "--dev" in sys.argv or os.environ.get("FLASK_ENV") == "development"
+    cookie_file = os.path.join(BASE_DIR, "cookies.txt")
+    cookie_status = "✅ found" if os.path.exists(cookie_file) else "⚠️  not found (transcripts will work without cookies for most videos)"
     print(f"🎬 YouTubeSummarizer server starting on http://localhost:{port}")
+    print(f"   cookies.txt: {cookie_status}")
+    print(f"   Environment: {'🔧 Development' if is_dev else '🚀 Production'}")
     app.run(debug=is_dev, host="0.0.0.0", port=port)
