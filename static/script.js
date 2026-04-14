@@ -234,16 +234,28 @@ async function handleSummarize() {
             }),
         });
 
+        const contentType = response.headers.get("content-type");
+        if (!contentType || !contentType.includes("application/json")) {
+            const text = await response.text();
+            console.error("Non-JSON response received:", text);
+            throw new Error(`Server returned an invalid response (Format: ${contentType || 'unknown'}). This usually happens due to a server timeout or crash.`);
+        }
+
         const data = await response.json();
 
         if (!response.ok) {
-            throw new Error(data.error || "Server error");
+            throw new Error(data.error || `Server Error (${response.status})`);
+        }
+
+        if (!data.results) {
+            throw new Error("Server returned success but no result data found.");
         }
 
         renderResults(data.results);
 
     } catch (error) {
-        showToast(`Error: ${error.message}`, "error");
+        console.error("Fetch Error:", error);
+        showToast(`${error.message}`, "error");
         document.querySelector(".input-section").style.display = "block";
     } finally {
         loadingSection.style.display = "none";
