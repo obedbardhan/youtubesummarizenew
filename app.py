@@ -129,15 +129,12 @@ def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None) -> O
             if not segments:
                 return None
             
-            from collections import namedtuple
-            Snippet = namedtuple('Snippet', ['start', 'duration', 'text'])
-            
             # Map fields with fallbacks for different Supadata API versions
-            return [Snippet(
-                float(s.get("start") if s.get("start") is not None else s.get("offset", 0)), 
-                float(s.get("duration") if s.get("duration") is not None else s.get("duration", 0)), 
-                s.get("text") or s.get("content", "")
-            ) for s in segments if s.get("text") or s.get("content")]
+            return [{
+                "start": float(s.get("start") if s.get("start") is not None else s.get("offset", 0)), 
+                "duration": float(s.get("duration") if s.get("duration") is not None else s.get("duration", 0)), 
+                "text": s.get("text") or s.get("content", "")
+            } for s in segments if s.get("text") or s.get("content")]
     except Exception as e:
         print(f"Supadata fetch failed: {e}")
     return None
@@ -231,10 +228,7 @@ def _try_manual_fetch_transcript(video_id: str, session: requests.Session) -> Op
                 "text": html.unescape(m.group(3))
             })
 
-        # Mock the Dataclass object for _format_transcript
-        from collections import namedtuple
-        Snippet = namedtuple('Snippet', ['start', 'duration', 'text'])
-        return [Snippet(s['start'], s['duration'], s['text']) for s in segments]
+        return segments
     except Exception as e:
         print(f"Manual fetch failed: {e}")
         return None
@@ -293,7 +287,7 @@ def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
     try:
         plain_session = requests.Session()
         plain_session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/133.0.0.0",
         })
         ytt_api = YouTubeTranscriptApi(http_client=plain_session)
         fetched = _try_fetch_transcript(ytt_api, video_id)
@@ -314,13 +308,16 @@ def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
     }
 
 
-def _format_transcript(fetched, debug_info: dict) -> dict:
+def _format_transcript(snippets, debug_info: dict) -> dict:
     """Format fetched transcript snippets into structured output."""
+    full_text = []
     formatted_segments = []
-    for snippet in fetched:
-        start = snippet.start
-        text = snippet.text
-        duration = snippet.duration
+
+    for snippet in snippets:
+        # snippets is now a list of dicts
+        start = snippet.get("start", 0)
+        text = snippet.get("text", "")
+        duration = snippet.get("duration", 0)
 
         minutes = int(start // 60)
         seconds = int(start % 60)
