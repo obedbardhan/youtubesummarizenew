@@ -114,30 +114,30 @@ def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None) -> O
         return None
 
     try:
-        # Supadata expects the full URL or just the ID for some endpoints.
-        # Reference: https://docs.supadata.ai/get-transcript
-        url = f"https://api.supadata.ai/v1/youtube/transcript?videoId={video_id}"
+        # Request English by default, Supadata will fallback if unavailable.
+        url = f"https://api.supadata.ai/v1/youtube/transcript?videoId={video_id}&lang=en"
         headers = {"x-api-key": api_key}
         resp = requests.get(url, headers=headers, timeout=15)
         
         if resp.status_code == 200:
             data = resp.json()
-            # Supadata usually returns a list of segments in data['content'] or directly.
-            # Verification: Based on docs, it might be in 'content' or 'transcript'
+            # Supadata might return segments in 'content', 'transcript', or directly in the response.
             segments = data.get("content") or data.get("transcript") or []
+            if not segments and isinstance(data, list):
+                segments = data
+            
             if not segments:
                 return None
             
-            # Format to match Snippet(start, duration, text)
             from collections import namedtuple
             Snippet = namedtuple('Snippet', ['start', 'duration', 'text'])
             
-            # Supadata segments usually have {text, start, duration}
+            # Map fields with fallbacks for different Supadata API versions
             return [Snippet(
-                float(s.get("start", 0)), 
-                float(s.get("duration", 0)), 
-                s.get("text", "")
-            ) for s in segments]
+                float(s.get("start") if s.get("start") is not None else s.get("offset", 0)), 
+                float(s.get("duration") if s.get("duration") is not None else s.get("duration", 0)), 
+                s.get("text") or s.get("content", "")
+            ) for s in segments if s.get("text") or s.get("content")]
     except Exception as e:
         print(f"Supadata fetch failed: {e}")
     return None
@@ -502,75 +502,82 @@ def health_check():
 @app.route("/api/summarize", methods=["POST"])
 def summarize():
     """Accept up to 5 YouTube URLs, fetch transcripts, and return summaries."""
-    data = request.get_json() or {}
-    urls = data.get("urls", [])
-    gemini_key = data.get("gemini_api_key", "")
+    try:
+        data = request.get_json() or {}
+        urls = data.get("urls", [])
+        gemini_key = data.get("gemini_api_key", "")
+        supadata_key = data.get("supadata_api_key", "")
 
-    if not urls:
-        return jsonify({"error": "No URLs provided."}), 400
+        if not urls:
+            return jsonify({"error": "No URLs provided."}), 400
 
-    if len(urls) > 5:
-        return jsonify({"error": "Maximum 5 URLs allowed."}), 400
+        if len(urls) > 5:
+            return jsonify({"error": "Maximum 5 URLs allowed."}), 400
 
-    if not gemini_key:
-        return jsonify({"error": "Gemini API key is required."}), 400
+        if not gemini_key:
+            return jsonify({"error": "Gemini API key is required."}), 400
 
-    # Validate and extract video IDs
-    tasks = []
-    for url in urls:
-        url = url.strip()
-        if not url:
-            continue
-        video_id = extract_video_id(url)
-        if not video_id:
-            tasks.append({
-                "url": url,
-                "error": f"Could not extract video ID from: {url}",
-            })
-        else:
-            tasks.append({
-                "url": url,
-                "video_id": video_id,
-            })
+        # Validate and extract video IDs
+        tasks = []
+        for url in urls:
+            url = url.strip()
+            if not url:
+                continue
+            video_id = extract_video_id(url)
+            if not video_id:
+                tasks.append({
+                    "url": url,
+                    "error": f"Could not extract video ID from: {url}",
+                })
+            else:
+                tasks.append({
+                    "url": url,
+                    "video_id": video_id,
+                })
 
-    # Process videos sequentially with a small delay to respect Supadata rate limits.
-    # (Concurrent requests to Supadata's free tier get rate-limited, causing failures.)
-    import time
-    results = []
-    valid_tasks = [t for t in tasks if "video_id" in t]
-    invalid_tasks = [t for t in tasks if "error" in t]
+        # Process videos sequentially
+        import time
+        results = []
+        valid_tasks = [t for t in tasks if "video_id" in t]
+        invalid_tasks = [t for t in tasks if "error" in t]
 
-    for i, task in enumerate(valid_tasks):
-        try:
-            result = process_single_video(
-                task["video_id"],
-                task["url"],
-                gemini_key,
-                supadata_key=data.get("supadata_api_key"),
-            )
-            results.append(result)
-        except Exception as e:
+        for i, task in enumerate(valid_tasks):
+            try:
+                result = process_single_video(
+                    task["video_id"],
+                    task["url"],
+                    gemini_key,
+                    supadata_key=supadata_key,
+                )
+                results.append(result)
+            except Exception as e:
+                print(f"Error processing video {task['video_id']}: {e}")
+                results.append({
+                    "url": task["url"],
+                    "video_id": task["video_id"],
+                    "error": f"Internal process error: {str(e)}",
+                    "title": "Failed to load"
+                })
+            # Small delay between requests to avoid rate limits
+            if i < len(valid_tasks) - 1:
+                time.sleep(1.0)
+
+        # Add invalid URL errors
+        for t in invalid_tasks:
             results.append({
-                "url": task["url"],
-                "video_id": task["video_id"],
-                "error": str(e),
+                "url": t["url"],
+                "error": t["error"],
             })
-        # Small delay between requests to avoid rate limits (skip after last)
-        if i < len(valid_tasks) - 1:
-            time.sleep(1.5)
 
-    # Add invalid URL errors
-    for t in invalid_tasks:
-        results.append({
-            "url": t["url"],
-            "error": t["error"],
-        })
+        # Sort results in the same order as input URLs
+        url_order = {url.strip(): i for i, url in enumerate(urls)}
+        results.sort(key=lambda r: url_order.get(r.get("url", ""), 999))
 
-    # Sort results in the same order as input URLs
-    url_order = {url.strip(): i for i, url in enumerate(urls)}
-    results.sort(key=lambda r: url_order.get(r.get("url", ""), 999))
-
-    return jsonify({"results": results})
+        return jsonify({"results": results})
+    
+    except Exception as e:
+        print(f"FATAL API ERROR: {e}")
+        return jsonify({"error": f"A server-side error occurred: {str(e)}"}), 500
 
 
 if __name__ == "__main__":
