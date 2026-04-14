@@ -107,6 +107,42 @@ def _build_session_with_cookies() -> requests.Session:
     return session
 
 
+def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None) -> Optional[list]:
+    """Tier 0: Fetch transcript using Supadata API (handles cloud blocks/proxies)."""
+    api_key = provided_key or os.environ.get("SUPADATA_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        # Supadata expects the full URL or just the ID for some endpoints.
+        # Reference: https://docs.supadata.ai/get-transcript
+        url = f"https://api.supadata.ai/v1/youtube/transcript?videoId={video_id}"
+        headers = {"x-api-key": api_key}
+        resp = requests.get(url, headers=headers, timeout=15)
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            # Supadata usually returns a list of segments in data['content'] or directly.
+            # Verification: Based on docs, it might be in 'content' or 'transcript'
+            segments = data.get("content") or data.get("transcript") or []
+            if not segments:
+                return None
+            
+            # Format to match Snippet(start, duration, text)
+            from collections import namedtuple
+            Snippet = namedtuple('Snippet', ['start', 'duration', 'text'])
+            
+            # Supadata segments usually have {text, start, duration}
+            return [Snippet(
+                float(s.get("start", 0)), 
+                float(s.get("duration", 0)), 
+                s.get("text", "")
+            ) for s in segments]
+    except Exception as e:
+        print(f"Supadata fetch failed: {e}")
+    return None
+
+
 def _try_fetch_transcript(ytt_api, video_id: str):
     """Attempt to fetch transcript using multiple language strategies."""
     # Try English then Hindi
@@ -147,10 +183,17 @@ def _try_manual_fetch_transcript(video_id: str, session: requests.Session) -> Op
             return None
 
         # Look for the internal JSON player response containing caption URLs
+        # Pattern 1: Standard object assignment
         match = re.search(r'ytInitialPlayerResponse\s*=\s*({.*?});(?:</script>|\n)', resp.text, re.DOTALL)
         if not match:
-            # Try a second common format for this data
+            # Pattern 2: Var assignment
             match = re.search(r'var ytInitialPlayerResponse\s*=\s*({.*?});(?:</script>|\n)', resp.text, re.DOTALL)
+        if not match:
+            # Pattern 3: Window assignment (newly common)
+            match = re.search(r'window\[["\']ytInitialPlayerResponse["\']\]\s*=\s*({.*?});', resp.text, re.DOTALL)
+        if not match:
+            # Pattern 4: Bare json in script (aggressive)
+            match = re.search(r'ytInitialPlayerResponse\s*=\s*({.*?})};', resp.text, re.DOTALL)
 
         if not match:
             return None
@@ -197,9 +240,10 @@ def _try_manual_fetch_transcript(video_id: str, session: requests.Session) -> Op
         return None
 
 
-def fetch_transcript(video_id: str) -> dict:
-    """Fetch transcript using a custom multi-tier fallback strategy (No Supadata).
+def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
+    """Fetch transcript using a custom multi-tier fallback strategy.
 
+    Tier 0: Supadata (High reliability, bypasses cloud blocks)
     Tier 1: Manual Extraction (mimicking actual browser sequence)
     Tier 2: youtube-transcript-api with cookies + browser headers
     Tier 3: youtube-transcript-api plain
@@ -207,7 +251,22 @@ def fetch_transcript(video_id: str) -> dict:
     debug_info = {}
     last_error = None
 
-    # Build session with cookies and stealth headers
+    # ── Tier 0: Supadata ──
+    try:
+        active_supadata_key = supadata_key or os.environ.get("SUPADATA_API_KEY")
+        if active_supadata_key:
+            fetched = _try_supadata_fetch_transcript(video_id, provided_key=active_supadata_key)
+            if fetched:
+                debug_info["method"] = "supadata"
+                return _format_transcript(fetched, debug_info)
+            else:
+                debug_info["tier0_status"] = "Supadata returned empty or failed"
+        else:
+            debug_info["tier0_status"] = "SUPADATA_API_KEY not set"
+    except Exception as e:
+        debug_info["tier0_error"] = str(e)
+
+    # Build session with cookies and stealth headers for remaining tiers
     session = _build_session_with_cookies()
 
     # ── Tier 1: Manual Extraction ──
@@ -363,10 +422,10 @@ Be concise but comprehensive. Focus on the most important information."""
         return f"Summary generation failed: {str(e)}"
 
 
-def process_single_video(video_id: str, url: str, gemini_key: str) -> dict:
+def process_single_video(video_id: str, url: str, gemini_key: str, supadata_key: str = None) -> dict:
     """Process a single video: fetch metadata, transcript, and summary."""
     metadata = fetch_video_metadata(video_id)
-    transcript_data = fetch_transcript(video_id)
+    transcript_data = fetch_transcript(video_id, supadata_key=supadata_key)
 
     summary = ""
     if transcript_data["full_text"]:
@@ -425,10 +484,18 @@ def health_check():
         except Exception as e:
             cookie_info["cookie_error"] = str(e)
 
+    # Supadata diagnosis
+    supadata_key = os.environ.get("SUPADATA_API_KEY")
+    supadata_info = {
+        "configured": bool(supadata_key),
+        "key_preview": f"{supadata_key[:4]}...{supadata_key[-4:]}" if supadata_key and len(supadata_key) > 8 else "too short/none",
+    }
+
     return jsonify({
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "cookie_status": cookie_info,
+        "supadata_status": supadata_info,
     })
 
 
@@ -479,6 +546,7 @@ def summarize():
                 task["video_id"],
                 task["url"],
                 gemini_key,
+                supadata_key=data.get("supadata_api_key"),
             )
             results.append(result)
         except Exception as e:
