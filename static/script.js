@@ -5,13 +5,16 @@
 
 // ─── State ──────────────────────────────────────────────────────────
 const API_KEY_STORAGE_KEY = "yt_summarizer_gemini_key";
+const SUPADATA_KEY_STORAGE_KEY = "yt_summarizer_supadata_key";
 
 // ─── DOM References ─────────────────────────────────────────────────
 const settingsBtn = document.getElementById("settingsBtn");
 const settingsModal = document.getElementById("settingsModal");
 const closeSettings = document.getElementById("closeSettings");
 const apiKeyInput = document.getElementById("apiKeyInput");
+const supadataKeyInput = document.getElementById("supadataKeyInput");
 const toggleKeyVisibility = document.getElementById("toggleKeyVisibility");
+const toggleSupadataVisibility = document.getElementById("toggleSupadataVisibility");
 const saveKeyBtn = document.getElementById("saveKeyBtn");
 const summarizeBtn = document.getElementById("summarizeBtn");
 const urlCount = document.getElementById("urlCount");
@@ -30,10 +33,14 @@ document.addEventListener("DOMContentLoaded", () => {
 
 // ─── Settings ───────────────────────────────────────────────────────
 function initSettings() {
-    // Load saved key
-    const savedKey = localStorage.getItem(API_KEY_STORAGE_KEY);
-    if (savedKey) {
-        apiKeyInput.value = savedKey;
+    // Load saved keys
+    const savedGeminiKey = localStorage.getItem(API_KEY_STORAGE_KEY);
+    if (savedGeminiKey) {
+        apiKeyInput.value = savedGeminiKey;
+    }
+    const savedSupadataKey = localStorage.getItem(SUPADATA_KEY_STORAGE_KEY);
+    if (savedSupadataKey) {
+        supadataKeyInput.value = savedSupadataKey;
     }
 
     // Open modal
@@ -59,15 +66,27 @@ function initSettings() {
         apiKeyInput.type = isPassword ? "text" : "password";
     });
 
+    toggleSupadataVisibility.addEventListener("click", () => {
+        const isPassword = supadataKeyInput.type === "password";
+        supadataKeyInput.type = isPassword ? "text" : "password";
+    });
+
     // Save key
     saveKeyBtn.addEventListener("click", () => {
-        const key = apiKeyInput.value.trim();
-        if (key) {
-            localStorage.setItem(API_KEY_STORAGE_KEY, key);
+        const geminiKey = apiKeyInput.value.trim();
+        const supadataKey = supadataKeyInput.value.trim();
+
+        if (geminiKey) {
+            localStorage.setItem(API_KEY_STORAGE_KEY, geminiKey);
+            if (supadataKey) {
+                localStorage.setItem(SUPADATA_KEY_STORAGE_KEY, supadataKey);
+            } else {
+                localStorage.removeItem(SUPADATA_KEY_STORAGE_KEY);
+            }
             settingsModal.classList.remove("active");
-            showToast("API key saved successfully!", "success");
+            showToast("Settings saved successfully!", "success");
         } else {
-            showToast("Please enter a valid API key.", "error");
+            showToast("Gemini API key is required.", "error");
         }
     });
 
@@ -204,12 +223,14 @@ async function handleSummarize() {
     loadingText.textContent = `Fetching transcripts and generating summaries for ${urls.length} video${urls.length > 1 ? "s" : ""}...`;
 
     try {
+        const supadataKey = localStorage.getItem(SUPADATA_KEY_STORAGE_KEY);
         const response = await fetch("/api/summarize", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 urls: urls,
                 gemini_api_key: geminiKey,
+                supadata_api_key: supadataKey,
             }),
         });
 
@@ -359,6 +380,15 @@ function createVideoCard(result, index) {
         // Store full text for copy
         transcriptPanel.dataset.fullText = result.full_text || "";
     } else {
+        let debugLines = [];
+        if (result.debug) {
+            const d = result.debug;
+            debugLines.push(`• Method: ${d.method || "failed"}`);
+            if (d.tier0_status) debugLines.push(`• Tier 0: ${d.tier0_status}`);
+            if (d.manual_error) debugLines.push(`• Manual Err: ${d.manual_error}`);
+            if (d.tier2_error) debugLines.push(`• Library Err: ${d.tier2_error.substring(0, 40)}...`);
+        }
+
         transcriptPanel.innerHTML = `
             <div class="panel-header">
                 <div class="panel-title"><span class="icon">📋</span> Full Transcript</div>
@@ -366,9 +396,10 @@ function createVideoCard(result, index) {
             <div class="no-transcript">
                 <div class="icon">🚫</div>
                 <p>${result.transcript_error ? escapeHtml(result.transcript_error) : "No transcript available for this video."}</p>
-                ${result.debug ? `
+                ${debugLines.length > 0 ? `
                     <div class="debug-info" style="margin-top: 10px; padding: 8px; background: rgba(0,0,0,0.1); border-radius: 4px; font-family: monospace; font-size: 10px; text-align: left; border-left: 2px solid #5a5e72;">
-                        [Debug] Path: ${escapeHtml(result.debug.cookie_path)} | Exists: ${result.debug.cookie_exists} | Count: ${result.debug.cookies_loaded}
+                        [Debug Info]<br>
+                        ${debugLines.join("<br>")}
                     </div>
                 ` : ""}
             </div>

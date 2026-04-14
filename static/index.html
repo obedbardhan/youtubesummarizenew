@@ -49,18 +49,35 @@
                 <button class="modal-close" id="closeSettings">&times;</button>
             </div>
             <div class="modal-body">
-                <label for="apiKeyInput" class="input-label">Google Gemini API Key</label>
-                <div class="api-key-wrapper">
-                    <input type="password" id="apiKeyInput" class="api-key-input" placeholder="Enter your Gemini API key..." autocomplete="off">
-                    <button class="toggle-visibility" id="toggleKeyVisibility" title="Toggle visibility">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
-                            <circle cx="12" cy="12" r="3"/>
-                        </svg>
-                    </button>
+                <div class="setting-group" style="margin-bottom: 20px;">
+                    <label for="apiKeyInput" class="input-label">Google Gemini API Key</label>
+                    <div class="api-key-wrapper">
+                        <input type="password" id="apiKeyInput" class="api-key-input" placeholder="Enter Gemini key (required)..." autocomplete="off">
+                        <button class="toggle-visibility" id="toggleKeyVisibility" title="Toggle visibility">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                                <circle cx="12" cy="12" r="3"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <p class="input-hint">Required for summary generation.</p>
                 </div>
-                <p class="input-hint">Your key is stored locally in your browser and never shared.</p>
-                <button class="save-key-btn" id="saveKeyBtn">Save Key</button>
+
+                <div class="setting-group" style="margin-bottom: 20px;">
+                    <label for="supadataKeyInput" class="input-label">Supadata API Key (Optional)</label>
+                    <div class="api-key-wrapper">
+                        <input type="password" id="supadataKeyInput" class="api-key-input" placeholder="Enter Supadata key (to bypass blocks)..." autocomplete="off">
+                        <button class="toggle-visibility" id="toggleSupadataVisibility" title="Toggle visibility">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                                <circle cx="12" cy="12" r="3"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <p class="input-hint">Highly recommended for Render/Cloud deployments. <a href="https://supadata.ai" target="_blank" style="color: var(--accent);">Get free key</a></p>
+                </div>
+
+                <button class="save-key-btn" id="saveKeyBtn">Save Settings</button>
             </div>
         </div>
     </div>
