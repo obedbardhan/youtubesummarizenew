@@ -3,9 +3,7 @@
 import os
 import re
 import sys
-import json
 import socket
-import html
 import requests
 import urllib3.util.connection as urllib3_cn
 from flask import Flask, request, jsonify, send_from_directory
@@ -32,10 +30,10 @@ def extract_video_id(url: str) -> Optional[str]:
     """Extract the YouTube video ID from various URL formats."""
     url = url.strip()
     patterns = [
-        r"(?:v=|/v/)([\w-]{11})",                    # youtube.com/watch?v=ID
-        r"youtu\.be/([\w-]{11})",                     # youtu.be/ID
-        r"(?:embed/|shorts/)([\w-]{11})",             # embed or shorts
-        r"^([\w-]{11})$",                             # bare ID
+        r"(?:v=|/v/)([\w-]{11})",
+        r"youtu\.be/([\w-]{11})",
+        r"(?:embed/|shorts/)([\w-]{11})",
+        r"^([\w-]{11})$",
     ]
     for pattern in patterns:
         match = re.search(pattern, url)
@@ -47,7 +45,7 @@ def fetch_video_metadata(video_id: str) -> dict:
     """Fetch video title and thumbnail via oembed."""
     try:
         oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
-        resp = requests.get(oembed_url, timeout=5) # Reduced timeout to prevent hanging
+        resp = requests.get(oembed_url, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
             return {
@@ -63,8 +61,31 @@ def fetch_video_metadata(video_id: str) -> dict:
         "thumbnail": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
     }
 
+def _try_fetch_transcript(video_id: str, cookie_file: str = None) -> Optional[list]:
+    """Attempt to fetch transcript, strictly forcing English natively or via translation."""
+    try:
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, cookies=cookie_file)
+        
+        # 1. Try to find a native English transcript (manual or auto-generated)
+        try:
+            en_transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB', 'en-IN'])
+            return en_transcript.fetch()
+        except Exception:
+            pass # Move to translation phase
+        
+        # 2. If no English track exists, find ANY track and translate it to English
+        for transcript in transcript_list:
+            if transcript.is_translatable:
+                translated = transcript.translate('en')
+                return translated.fetch()
+                
+    except Exception as e:
+        print(f"Transcript fetch/translate error: {e}")
+    
+    return None
+
 def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None) -> Optional[list]:
-    """Tier 0: Fetch transcript using Supadata API (handles cloud blocks/proxies)."""
+    """Fallback: Fetch transcript using Supadata API."""
     api_key = provided_key or os.environ.get("SUPADATA_API_KEY")
     if not api_key:
         return None
@@ -92,46 +113,9 @@ def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None) -> O
         print(f"Supadata fetch failed: {e}")
     return None
 
-def _try_fetch_transcript(video_id: str, cookie_file: str = None) -> Optional[list]:
-    """Attempt to fetch transcript, forcing English natively or via translation."""
-    try:
-        # 1. Try extracting native English transcripts first
-        try:
-            return YouTubeTranscriptApi.get_transcript(
-                video_id, 
-                languages=["en", "en-US", "en-GB"], 
-                cookies=cookie_file
-            )
-        except Exception:
-            pass # Move to translation fallback
-        
-        # 2. Fallback: Get any available transcript and translate it to English
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, cookies=cookie_file)
-        for transcript in transcript_list:
-            if transcript.is_translatable:
-                return transcript.translate('en').fetch()
-                
-    except Exception as e:
-        print(f"Transcript fetch error: {e}")
-    
-    return None
-
 def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
-    """Fetch transcript using a streamlined strategy to prevent timeouts."""
+    """Fetch transcript prioritizing native translation."""
     debug_info = {}
-
-    # ── Tier 0: Supadata ──
-    try:
-        active_supadata_key = supadata_key or os.environ.get("SUPADATA_API_KEY")
-        if active_supadata_key:
-            fetched = _try_supadata_fetch_transcript(video_id, provided_key=active_supadata_key)
-            if fetched:
-                debug_info["method"] = "supadata"
-                return _format_transcript(fetched, debug_info)
-    except Exception as e:
-        debug_info["tier0_error"] = str(e)
-
-    # ── Tier 1: YouTubeTranscriptApi ──
     cookie_file = None
     render_cookie_path = "/etc/secrets/cookies.txt"
     local_cookie_path = os.path.join(BASE_DIR, "cookies.txt")
@@ -141,14 +125,26 @@ def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
     elif os.path.exists(local_cookie_path):
         cookie_file = local_cookie_path
 
+    # ── Tier 1: YouTubeTranscriptApi (Best for Forced Translation) ──
     fetched = _try_fetch_transcript(video_id, cookie_file)
     if fetched:
-        debug_info["method"] = "youtube_transcript_api"
+        debug_info["method"] = "youtube_transcript_api_translated"
         return _format_transcript(fetched, debug_info)
+
+    # ── Tier 2: Supadata (Fallback if blocked) ──
+    try:
+        active_supadata_key = supadata_key or os.environ.get("SUPADATA_API_KEY")
+        if active_supadata_key:
+            fetched_supa = _try_supadata_fetch_transcript(video_id, provided_key=active_supadata_key)
+            if fetched_supa:
+                debug_info["method"] = "supadata"
+                return _format_transcript(fetched_supa, debug_info)
+    except Exception as e:
+        debug_info["tier2_error"] = str(e)
 
     # All tiers failed
     return {
-        "error": "Could not extract transcript. Video might lack captions or be restricted.",
+        "error": "Could not extract or translate transcript. Video might lack captions.",
         "segments": [],
         "full_text": "",
         "debug": debug_info,
@@ -192,10 +188,8 @@ def summarize_transcript(gemini_key: str, title: str, full_text: str) -> str:
 
     try:
         genai.configure(api_key=gemini_key)
-        # Directly call the fastest model to skip network latency of listing models
-        model = genai.GenerativeModel("gemini-1.5-flash")
 
-        max_chars = 25000 # Capped to ensure fast response times
+        max_chars = 25000 
         text_to_summarize = full_text[:max_chars]
         if len(full_text) > max_chars:
             text_to_summarize += "\n\n[Transcript truncated for summarization]"
@@ -221,7 +215,19 @@ Provide your summary in the following format:
 
 Be concise but comprehensive. Focus on the most important information."""
 
-        response = model.generate_content(prompt)
+        # Attempt to use the faster/cheaper flash model first
+        try:
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            response = model.generate_content(prompt)
+        except Exception as e:
+            # If 1.5-flash throws a 404 error, gracefully fall back to standard gemini-pro
+            if "404" in str(e) or "not found" in str(e).lower():
+                print("⚠️ gemini-1.5-flash not found, falling back to gemini-pro")
+                model = genai.GenerativeModel("gemini-pro")
+                response = model.generate_content(prompt)
+            else:
+                raise e # Raise other unexpected errors
+
         return response.text.strip()
     except Exception as e:
         return f"Summary generation failed: {str(e)}"
