@@ -26,7 +26,7 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
 CORS(app)
 
-# Lock to prevent Gemini API from crashing due to simultaneous burst requests
+# Lock to strictly control API requests and prevent Rate Limiting (429) and Thread Crashes
 gemini_lock = threading.Lock()
 
 # ─── Helpers ──────────────────────────────────────────────────────────
@@ -76,7 +76,7 @@ def _try_fetch_transcript(video_id: str, cookie_file: str = None) -> Optional[li
             en_transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB', 'en-IN'])
             return en_transcript.fetch()
         except Exception:
-            pass 
+            pass # Move to translation phase
         
         for transcript in transcript_list:
             if transcript.is_translatable:
@@ -180,8 +180,8 @@ def _format_transcript(snippets, debug_info: dict) -> dict:
         "debug": debug_info,
     }
 
-def summarize_transcript(title: str, full_text: str) -> str:
-    """Generate an AI summary of the transcript."""
+def summarize_transcript(title: str, full_text: str, model_name: str) -> str:
+    """Generate an AI summary using the exact validated model name."""
     if not full_text:
         return "No transcript text available to summarize."
 
@@ -212,35 +212,27 @@ Provide your summary in the following format:
 
 Be concise but comprehensive. Focus on the most important information."""
 
-        # 🚀 Use the lock to prevent Google API from throwing 429 Quota errors
+        # 🚀 Thread Lock forces API requests to queue up safely, preventing Google Quota limits
         with gemini_lock:
             try:
-                model = genai.GenerativeModel("gemini-1.5-flash")
+                model = genai.GenerativeModel(model_name)
                 response = model.generate_content(prompt)
-                time.sleep(0.5) # Stagger requests slightly to keep the API happy
+                time.sleep(1.0) # 1-second delay keeps the API happy and prevents crashes
                 return response.text.strip()
             except Exception as e:
-                if "404" in str(e) or "not found" in str(e).lower():
-                    try:
-                        fallback_model = genai.GenerativeModel("gemini-pro")
-                        response = fallback_model.generate_content(prompt)
-                        time.sleep(0.5)
-                        return response.text.strip()
-                    except Exception:
-                        return "Summary failed: No compatible Gemini models found for your API key."
-                raise e
+                return f"Summary failed: API rejected the request. Details: {str(e)}"
 
     except Exception as e:
         return f"Summary generation failed: {str(e)}"
 
-def process_single_video(video_id: str, url: str, supadata_key: str = None) -> dict:
-    """Process a single video: fetch metadata, transcript, and summary."""
+def process_single_video(video_id: str, url: str, target_model: str, supadata_key: str = None) -> dict:
+    """Process a single video completely independently."""
     metadata = fetch_video_metadata(video_id)
     transcript_data = fetch_transcript(video_id, supadata_key=supadata_key)
 
     summary = ""
     if transcript_data["full_text"]:
-        summary = summarize_transcript(metadata["title"], transcript_data["full_text"])
+        summary = summarize_transcript(metadata["title"], transcript_data["full_text"], target_model)
     elif transcript_data["error"]:
         summary = f"⚠️ Could not generate summary: {transcript_data['error']}"
 
@@ -273,27 +265,39 @@ def health_check():
 
 @app.route("/api/summarize", methods=["POST"])
 def summarize():
-    """Accept up to 5 YouTube URLs, fetch transcripts concurrently, and return summaries."""
+    """Accept up to 5 YouTube URLs, validate the model, and fetch summaries robustly."""
     try:
         data = request.get_json() or {}
         raw_urls = data.get("urls", [])
         gemini_key = data.get("gemini_api_key", "")
         supadata_key = data.get("supadata_api_key", "")
 
-        # Process the array exactly as it comes from the frontend
-        urls = []
-        for raw_item in raw_urls:
-            if raw_item and str(raw_item).strip():
-                urls.append(str(raw_item).strip())
-
-        # Cap at 5, but DO NOT REMOVE DUPLICATES (allows testing the same link)
+        urls = [str(u).strip() for u in raw_urls if u and str(u).strip()]
         urls = urls[:5]
 
-        if not urls: return jsonify({"error": "No URLs provided."}), 400
+        if not urls: return jsonify({"error": "No valid URLs provided."}), 400
         if not gemini_key: return jsonify({"error": "Gemini API key is required."}), 400
 
-        # Configure Gemini globally ONCE
+        print(f"🎬 Processing {len(urls)} videos...")
+
+        # 🚀 SMART AUTO-DISCOVERY: Find the exact model name this API key allows
         genai.configure(api_key=gemini_key)
+        target_model = "gemini-1.5-flash" # Absolute default
+        try:
+            available_models = list(genai.list_models())
+            text_models = [m.name.replace("models/", "") for m in available_models if "generateContent" in m.supported_generation_methods]
+            
+            if not text_models:
+                return jsonify({"error": "Your API key does not have access to any text generation models."}), 403
+                
+            # Prefer flash, otherwise use the first available text model
+            flash_models = [m for m in text_models if "1.5-flash" in m]
+            target_model = flash_models[0] if flash_models else text_models[0]
+            print(f"✅ Discovered allowed model for this key: {target_model}")
+        except Exception as e:
+            if "API key not valid" in str(e):
+                return jsonify({"error": "Invalid Gemini API Key."}), 401
+            print(f"⚠️ Warning: Could not auto-discover models ({e}). Proceeding with default.")
 
         tasks = []
         for url in urls:
@@ -308,33 +312,30 @@ def summarize():
         invalid_tasks = [t for t in tasks if "error" in t]
 
         def safe_process(task):
+            # This completely isolates errors so one bad video doesn't break the others
             try:
-                return process_single_video(task["video_id"], task["url"], supadata_key=supadata_key)
+                return process_single_video(task["video_id"], task["url"], target_model, supadata_key=supadata_key)
             except Exception as e:
-                return {"url": task["url"], "video_id": task["video_id"], "error": f"Thread crashed: {str(e)}", "title": "Failed to load"}
+                return {"url": task["url"], "video_id": task["video_id"], "error": f"Task Failed: {str(e)}", "title": "Failed to load"}
 
-        # Fetch all data concurrently
+        # Fire off all valid tasks safely
         with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = []
-            # Start the threads with a tiny delay between them to prevent burst errors
-            for task in valid_tasks:
-                futures.append(executor.submit(safe_process, task))
-                time.sleep(0.1) 
-                
+            futures = {executor.submit(safe_process, task): task for task in valid_tasks}
             for future in as_completed(futures):
                 results.append(future.result())
 
+        # Append any URLs that failed immediately
         for t in invalid_tasks:
             results.append({"url": t["url"], "error": t["error"]})
 
-        # Restore original input order
+        # Ensure the final output matches the order the user typed them in
         url_order = {url.strip(): i for i, url in enumerate(urls)}
         results.sort(key=lambda r: url_order.get(r.get("url", ""), 999))
 
         return jsonify({"results": results})
     
     except Exception as e:
-        return jsonify({"error": f"A server-side error occurred: {str(e)}"}), 500
+        return jsonify({"error": f"A critical server error occurred: {str(e)}"}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8082))
