@@ -3,8 +3,10 @@
 import os
 import re
 import sys
+import time
 import socket
 import requests
+import threading
 import urllib3.util.connection as urllib3_cn
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -23,6 +25,9 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
 CORS(app)
+
+# Lock to prevent Gemini API from crashing due to simultaneous burst requests
+gemini_lock = threading.Lock()
 
 # ─── Helpers ──────────────────────────────────────────────────────────
 from typing import Optional
@@ -71,7 +76,7 @@ def _try_fetch_transcript(video_id: str, cookie_file: str = None) -> Optional[li
             en_transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB', 'en-IN'])
             return en_transcript.fetch()
         except Exception:
-            pass # Move to translation phase
+            pass 
         
         for transcript in transcript_list:
             if transcript.is_translatable:
@@ -79,7 +84,7 @@ def _try_fetch_transcript(video_id: str, cookie_file: str = None) -> Optional[li
                 return translated.fetch()
                 
     except Exception as e:
-        print(f"Transcript fetch/translate error: {e}")
+        print(f"Transcript fetch error: {e}")
     
     return None
 
@@ -176,7 +181,7 @@ def _format_transcript(snippets, debug_info: dict) -> dict:
     }
 
 def summarize_transcript(title: str, full_text: str) -> str:
-    """Generate an AI summary of the transcript (API Key must be configured globally first)."""
+    """Generate an AI summary of the transcript."""
     if not full_text:
         return "No transcript text available to summarize."
 
@@ -207,20 +212,23 @@ Provide your summary in the following format:
 
 Be concise but comprehensive. Focus on the most important information."""
 
-        # Direct, thread-safe fallback logic
-        try:
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            response = model.generate_content(prompt)
-            return response.text.strip()
-        except Exception as e:
-            if "404" in str(e) or "not found" in str(e).lower():
-                try:
-                    fallback_model = genai.GenerativeModel("gemini-pro")
-                    response = fallback_model.generate_content(prompt)
-                    return response.text.strip()
-                except Exception:
-                    return "Summary failed: No compatible Gemini models found for your API key."
-            raise e
+        # 🚀 Use the lock to prevent Google API from throwing 429 Quota errors
+        with gemini_lock:
+            try:
+                model = genai.GenerativeModel("gemini-1.5-flash")
+                response = model.generate_content(prompt)
+                time.sleep(0.5) # Stagger requests slightly to keep the API happy
+                return response.text.strip()
+            except Exception as e:
+                if "404" in str(e) or "not found" in str(e).lower():
+                    try:
+                        fallback_model = genai.GenerativeModel("gemini-pro")
+                        response = fallback_model.generate_content(prompt)
+                        time.sleep(0.5)
+                        return response.text.strip()
+                    except Exception:
+                        return "Summary failed: No compatible Gemini models found for your API key."
+                raise e
 
     except Exception as e:
         return f"Summary generation failed: {str(e)}"
@@ -265,24 +273,30 @@ def health_check():
 
 @app.route("/api/summarize", methods=["POST"])
 def summarize():
-    """Accept up to 5 YouTube URLs, fetch transcripts, and return summaries concurrently."""
+    """Accept up to 5 YouTube URLs, fetch transcripts concurrently, and return summaries."""
     try:
         data = request.get_json() or {}
-        urls = data.get("urls", [])
+        raw_urls = data.get("urls", [])
         gemini_key = data.get("gemini_api_key", "")
         supadata_key = data.get("supadata_api_key", "")
 
+        # Process the array exactly as it comes from the frontend
+        urls = []
+        for raw_item in raw_urls:
+            if raw_item and str(raw_item).strip():
+                urls.append(str(raw_item).strip())
+
+        # Cap at 5, but DO NOT REMOVE DUPLICATES (allows testing the same link)
+        urls = urls[:5]
+
         if not urls: return jsonify({"error": "No URLs provided."}), 400
-        if len(urls) > 5: return jsonify({"error": "Maximum 5 URLs allowed."}), 400
         if not gemini_key: return jsonify({"error": "Gemini API key is required."}), 400
 
-        # Configure Gemini globally ONCE before starting threads to prevent race conditions
+        # Configure Gemini globally ONCE
         genai.configure(api_key=gemini_key)
 
         tasks = []
         for url in urls:
-            url = url.strip()
-            if not url: continue
             video_id = extract_video_id(url)
             if not video_id:
                 tasks.append({"url": url, "error": f"Could not extract video ID from: {url}"})
@@ -293,24 +307,27 @@ def summarize():
         valid_tasks = [t for t in tasks if "video_id" in t]
         invalid_tasks = [t for t in tasks if "error" in t]
 
-        # Bulletproof wrapper for the thread executor
         def safe_process(task):
             try:
                 return process_single_video(task["video_id"], task["url"], supadata_key=supadata_key)
             except Exception as e:
                 return {"url": task["url"], "video_id": task["video_id"], "error": f"Thread crashed: {str(e)}", "title": "Failed to load"}
 
-        # Run valid tasks concurrently
+        # Fetch all data concurrently
         with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(safe_process, task) for task in valid_tasks]
+            futures = []
+            # Start the threads with a tiny delay between them to prevent burst errors
+            for task in valid_tasks:
+                futures.append(executor.submit(safe_process, task))
+                time.sleep(0.1) 
+                
             for future in as_completed(futures):
                 results.append(future.result())
 
-        # Add any tasks that failed validation instantly
         for t in invalid_tasks:
             results.append({"url": t["url"], "error": t["error"]})
 
-        # Restore the original order the user entered them in
+        # Restore original input order
         url_order = {url.strip(): i for i, url in enumerate(urls)}
         results.sort(key=lambda r: url_order.get(r.get("url", ""), 999))
 
