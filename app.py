@@ -8,18 +8,15 @@ import socket
 import html
 import requests
 import urllib3.util.connection as urllib3_cn
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
+from youtube_transcript_api import YouTubeTranscriptApi
+import google.generativeai as genai
 
-# Force IPv4 to bypass severe IPv6 DNS routing timeouts and avoids cloud IPv6 bans.
+# Force IPv4 to bypass severe IPv6 DNS routing timeouts
 def allowed_gai_family():
     return socket.AF_INET
 urllib3_cn.allowed_gai_family = allowed_gai_family
-
-from youtube_transcript_api import YouTubeTranscriptApi
-
-import google.generativeai as genai
 
 # Secure deterministic file paths for remote static deployments
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,10 +25,8 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
 CORS(app)
 
-
 # ─── Helpers ──────────────────────────────────────────────────────────
 from typing import Optional
-
 
 def extract_video_id(url: str) -> Optional[str]:
     """Extract the YouTube video ID from various URL formats."""
@@ -48,12 +43,11 @@ def extract_video_id(url: str) -> Optional[str]:
             return match.group(1)
     return None
 
-
 def fetch_video_metadata(video_id: str) -> dict:
-    """Fetch video title and thumbnail via oembed (no API key needed)."""
+    """Fetch video title and thumbnail via oembed."""
     try:
         oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
-        resp = requests.get(oembed_url, timeout=10)
+        resp = requests.get(oembed_url, timeout=5) # Reduced timeout to prevent hanging
         if resp.status_code == 200:
             data = resp.json()
             return {
@@ -69,44 +63,6 @@ def fetch_video_metadata(video_id: str) -> dict:
         "thumbnail": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
     }
 
-
-def _build_session_with_cookies() -> requests.Session:
-    """Build a requests session with cookies loaded (if available) and realistic browser headers."""
-    import http.cookiejar
-    session = requests.Session()
-
-    # Realistic browser headers to avoid simple bot detection
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
-        "Cache-Control": "max-age=0",
-        "Sec-Ch-Ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1"
-    })
-
-    # Load cookies if available
-    render_cookie_path = "/etc/secrets/cookies.txt"
-    local_cookie_path = os.path.join(BASE_DIR, "cookies.txt")
-    cookie_file = render_cookie_path if os.path.exists(render_cookie_path) else local_cookie_path
-
-    if os.path.exists(cookie_file):
-        try:
-            jar = http.cookiejar.MozillaCookieJar(cookie_file)
-            jar.load(ignore_discard=True, ignore_expires=True)
-            session.cookies.update(jar)
-        except Exception as e:
-            print(f"⚠️  Cookie load warning: {e}")
-
-    return session
-
-
 def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None) -> Optional[list]:
     """Tier 0: Fetch transcript using Supadata API (handles cloud blocks/proxies)."""
     api_key = provided_key or os.environ.get("SUPADATA_API_KEY")
@@ -114,14 +70,12 @@ def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None) -> O
         return None
 
     try:
-        # Request English by default, Supadata will fallback if unavailable.
         url = f"https://api.supadata.ai/v1/youtube/transcript?videoId={video_id}&lang=en"
         headers = {"x-api-key": api_key}
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, headers=headers, timeout=10)
         
         if resp.status_code == 200:
             data = resp.json()
-            # Supadata might return segments in 'content', 'transcript', or directly in the response.
             segments = data.get("content") or data.get("transcript") or []
             if not segments and isinstance(data, list):
                 segments = data
@@ -129,7 +83,6 @@ def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None) -> O
             if not segments:
                 return None
             
-            # Map fields with fallbacks for different Supadata API versions
             return [{
                 "start": float(s.get("start") if s.get("start") is not None else s.get("offset", 0)), 
                 "duration": float(s.get("duration") if s.get("duration") is not None else s.get("duration", 0)), 
@@ -139,111 +92,33 @@ def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None) -> O
         print(f"Supadata fetch failed: {e}")
     return None
 
-
-def _try_fetch_transcript(ytt_api, video_id: str):
-    """Attempt to fetch transcript using multiple language strategies."""
-    # Try English then Hindi
+def _try_fetch_transcript(video_id: str, cookie_file: str = None) -> Optional[list]:
+    """Attempt to fetch transcript, forcing English natively or via translation."""
     try:
-        return ytt_api.fetch(video_id, languages=["en", "hi"])
-    except Exception:
-        pass
-
-    # Try listing available transcripts and translating
-    try:
-        transcript_list = ytt_api.list(video_id)
-        for t in transcript_list:
-            try:
-                return t.translate("en").fetch()
-            except Exception:
-                continue
-        # Last resort: any language
-        for t in transcript_list:
-            try:
-                return t.fetch()
-            except Exception:
-                continue
-    except Exception:
-        pass
-
+        # 1. Try extracting native English transcripts first
+        try:
+            return YouTubeTranscriptApi.get_transcript(
+                video_id, 
+                languages=["en", "en-US", "en-GB"], 
+                cookies=cookie_file
+            )
+        except Exception:
+            pass # Move to translation fallback
+        
+        # 2. Fallback: Get any available transcript and translate it to English
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, cookies=cookie_file)
+        for transcript in transcript_list:
+            if transcript.is_translatable:
+                return transcript.translate('en').fetch()
+                
+    except Exception as e:
+        print(f"Transcript fetch error: {e}")
+    
     return None
 
-
-def _try_manual_fetch_transcript(video_id: str, session: requests.Session) -> Optional[list]:
-    """Fallback: Manually extract transcript by parsing the YouTube page HTML.
-    This is extremely robust against simple library blocks.
-    """
-    try:
-        # Fetch the video page with same session/cookies as a real browser
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        resp = session.get(url, timeout=15)
-        if resp.status_code != 200:
-            return None
-
-        # Look for the internal JSON player response containing caption URLs
-        # Pattern 1: Standard object assignment
-        match = re.search(r'ytInitialPlayerResponse\s*=\s*({.*?});(?:</script>|\n)', resp.text, re.DOTALL)
-        if not match:
-            # Pattern 2: Var assignment
-            match = re.search(r'var ytInitialPlayerResponse\s*=\s*({.*?});(?:</script>|\n)', resp.text, re.DOTALL)
-        if not match:
-            # Pattern 3: Window assignment (newly common)
-            match = re.search(r'window\[["\']ytInitialPlayerResponse["\']\]\s*=\s*({.*?});', resp.text, re.DOTALL)
-        if not match:
-            # Pattern 4: Bare json in script (aggressive)
-            match = re.search(r'ytInitialPlayerResponse\s*=\s*({.*?})};', resp.text, re.DOTALL)
-
-        if not match:
-            return None
-
-        data = json.loads(match.group(1))
-        captions = data.get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
-
-        if not captions:
-            return None
-
-        # Pick best track (English preferred, then Hindi)
-        target_track = next((t for t in captions if ".en" in t.get("vssId", "")), None)
-        if not target_track:
-            target_track = next((t for t in captions if ".hi" in t.get("vssId", "")), None)
-        if not target_track:
-            target_track = captions[0]
-
-        base_url = target_track.get("baseUrl")
-        if not base_url:
-            return None
-
-        # Fetch the raw XML transcript
-        xml_resp = session.get(base_url, timeout=10)
-        if xml_resp.status_code != 200:
-            return None
-
-        # Basic XML extraction of <text start="X" dur="Y">CONTENT</text>
-        # We don't need a heavy XML parser for this simple structure
-        segments = []
-        matches = re.finditer(r'<text start="([\d.]+)" dur="([\d.]+)".*?>(.*?)</text>', xml_resp.text)
-        for m in matches:
-            segments.append({
-                "start": float(m.group(1)),
-                "duration": float(m.group(2)),
-                "text": html.unescape(m.group(3))
-            })
-
-        return segments
-    except Exception as e:
-        print(f"Manual fetch failed: {e}")
-        return None
-
-
 def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
-    """Fetch transcript using a custom multi-tier fallback strategy.
-
-    Tier 0: Supadata (High reliability, bypasses cloud blocks)
-    Tier 1: Manual Extraction (mimicking actual browser sequence)
-    Tier 2: youtube-transcript-api with cookies + browser headers
-    Tier 3: youtube-transcript-api plain
-    """
+    """Fetch transcript using a streamlined strategy to prevent timeouts."""
     debug_info = {}
-    last_error = None
 
     # ── Tier 0: Supadata ──
     try:
@@ -253,84 +128,54 @@ def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
             if fetched:
                 debug_info["method"] = "supadata"
                 return _format_transcript(fetched, debug_info)
-            else:
-                debug_info["tier0_status"] = "Supadata returned empty or failed"
-        else:
-            debug_info["tier0_status"] = "SUPADATA_API_KEY not set"
     except Exception as e:
         debug_info["tier0_error"] = str(e)
 
-    # Build session with cookies and stealth headers for remaining tiers
-    session = _build_session_with_cookies()
+    # ── Tier 1: YouTubeTranscriptApi ──
+    cookie_file = None
+    render_cookie_path = "/etc/secrets/cookies.txt"
+    local_cookie_path = os.path.join(BASE_DIR, "cookies.txt")
+    
+    if os.path.exists(render_cookie_path):
+        cookie_file = render_cookie_path
+    elif os.path.exists(local_cookie_path):
+        cookie_file = local_cookie_path
 
-    # ── Tier 1: Manual Extraction ──
-    try:
-        fetched = _try_manual_fetch_transcript(video_id, session)
-        if fetched:
-            debug_info["method"] = "manual_extraction"
-            return _format_transcript(fetched, debug_info)
-    except Exception as e:
-        debug_info["tier1_error"] = str(e)
-
-    # ── Tier 2: Library with auth ──
-    try:
-        ytt_api = YouTubeTranscriptApi(http_client=session)
-        fetched = _try_fetch_transcript(ytt_api, video_id)
-        if fetched:
-            debug_info["method"] = "yt_api_with_cookies"
-            return _format_transcript(fetched, debug_info)
-    except Exception as e:
-        last_error = e
-        debug_info["tier2_error"] = str(e)
-
-    # ── Tier 3: Library plain ──
-    try:
-        plain_session = requests.Session()
-        plain_session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/133.0.0.0",
-        })
-        ytt_api = YouTubeTranscriptApi(http_client=plain_session)
-        fetched = _try_fetch_transcript(ytt_api, video_id)
-        if fetched:
-            debug_info["method"] = "yt_api_plain"
-            return _format_transcript(fetched, debug_info)
-    except Exception as e:
-        last_error = e
-        debug_info["tier3_error"] = str(e)
+    fetched = _try_fetch_transcript(video_id, cookie_file)
+    if fetched:
+        debug_info["method"] = "youtube_transcript_api"
+        return _format_transcript(fetched, debug_info)
 
     # All tiers failed
-    error_msg = str(last_error) if last_error else "No transcript available"
     return {
-        "error": f"Cloud block or Disabled: {error_msg}",
+        "error": "Could not extract transcript. Video might lack captions or be restricted.",
         "segments": [],
         "full_text": "",
         "debug": debug_info,
     }
 
-
 def _format_transcript(snippets, debug_info: dict) -> dict:
     """Format fetched transcript snippets into structured output."""
-    full_text = []
     formatted_segments = []
 
     for snippet in snippets:
-        # snippets is now a list of dicts
-        start = snippet.get("start", 0)
-        text = snippet.get("text", "")
-        duration = snippet.get("duration", 0)
+        try:
+            if isinstance(snippet, dict):
+                start, text, duration = snippet.get("start", 0), snippet.get("text", ""), snippet.get("duration", 0)
+            else:
+                start, text, duration = getattr(snippet, "start", 0), getattr(snippet, "text", ""), getattr(snippet, "duration", 0)
+        except Exception:
+            continue
 
-        minutes = int(start // 60)
-        seconds = int(start % 60)
-        timestamp = f"{minutes:02d}:{seconds:02d}"
+        minutes, seconds = int(start // 60), int(start % 60)
         formatted_segments.append({
-            "timestamp": timestamp,
+            "timestamp": f"{minutes:02d}:{seconds:02d}",
             "start": start,
             "duration": duration,
             "text": text,
         })
 
     full_text = " ".join(s["text"] for s in formatted_segments)
-
     return {
         "segments": formatted_segments,
         "full_text": full_text,
@@ -338,56 +183,24 @@ def _format_transcript(snippets, debug_info: dict) -> dict:
         "debug": debug_info,
     }
 
-
-def get_best_model(gemini_key: str) -> str:
-    """Auto-detect the best available Gemini model."""
-    genai.configure(api_key=gemini_key)
-    try:
-        models = genai.list_models()
-        flash_models = []
-        for m in models:
-            methods = m.supported_generation_methods
-            if "generateContent" in methods and "flash" in m.name.lower():
-                flash_models.append(m.name)
-
-        if flash_models:
-            flash_models.sort(reverse=True)
-            best = flash_models[0]
-            return best.replace("models/", "") if best.startswith("models/") else best
-    except Exception as e:
-        print(f"Could not list models: {e}")
-
-    # Fallback list
-    return "gemini-1.5-flash"
-
-
-# Cache the detected model name per API key
-_model_cache = {}
-
-
 def summarize_transcript(gemini_key: str, title: str, full_text: str) -> str:
     """Generate an AI summary of the transcript using Gemini."""
     if not gemini_key:
         return "No API key provided — cannot generate summary."
-
     if not full_text:
         return "No transcript text available to summarize."
 
-    genai.configure(api_key=gemini_key)
+    try:
+        genai.configure(api_key=gemini_key)
+        # Directly call the fastest model to skip network latency of listing models
+        model = genai.GenerativeModel("gemini-1.5-flash")
 
-    # Get or detect the best model
-    if gemini_key not in _model_cache:
-        _model_cache[gemini_key] = get_best_model(gemini_key)
-    model_name = _model_cache[gemini_key]
-    model = genai.GenerativeModel(model_name)
+        max_chars = 25000 # Capped to ensure fast response times
+        text_to_summarize = full_text[:max_chars]
+        if len(full_text) > max_chars:
+            text_to_summarize += "\n\n[Transcript truncated for summarization]"
 
-    # Truncate very long transcripts to avoid token limits
-    max_chars = 30000
-    text_to_summarize = full_text[:max_chars]
-    if len(full_text) > max_chars:
-        text_to_summarize += "\n\n[Transcript truncated for summarization]"
-
-    prompt = f"""You are an expert content analyst. Summarize the following YouTube video transcript into a clear, well-structured summary.
+        prompt = f"""You are an expert content analyst. Summarize the following YouTube video transcript into a clear, well-structured summary.
 
 Video Title: "{title}"
 
@@ -401,23 +214,17 @@ Provide your summary in the following format:
 • [Key point 1]
 • [Key point 2]
 • [Key point 3]
-• [Key point 4]
-• [Key point 5]
 
 💡 **Key Takeaways**:
 • [Most important insight or action item 1]
 • [Most important insight or action item 2]
-• [Most important insight or action item 3]
 
 Be concise but comprehensive. Focus on the most important information."""
 
-    try:
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
-        _model_cache.pop(gemini_key, None)
         return f"Summary generation failed: {str(e)}"
-
 
 def process_single_video(video_id: str, url: str, gemini_key: str, supadata_key: str = None) -> dict:
     """Process a single video: fetch metadata, transcript, and summary."""
@@ -442,59 +249,20 @@ def process_single_video(video_id: str, url: str, gemini_key: str, supadata_key:
         "summary": summary,
     }
 
-
 # ─── Routes ───────────────────────────────────────────────────────────
 
 @app.route("/favicon.ico")
 def favicon():
     return "", 204
 
-
 @app.route("/")
 def index():
-    # Use app.static_folder to ensure a fully resolved absolute path is used.
-    # If the file still 404s, it means the static/ folder is literally missing entirely on the remote deployment.
     return send_from_directory(app.static_folder, "index.html")
-
 
 @app.route("/api/health", methods=["GET"])
 def health_check():
     from datetime import datetime, timezone
-    import http.cookiejar
-
-    # Cookie diagnosis
-    render_path = "/etc/secrets/cookies.txt"
-    local_path = os.path.join(BASE_DIR, "cookies.txt")
-    cookie_info = {
-        "render_path_exists": os.path.exists(render_path),
-        "local_path_exists": os.path.exists(local_path),
-        "active_path": render_path if os.path.exists(render_path) else local_path,
-        "active_path_exists": os.path.exists(render_path) or os.path.exists(local_path),
-        "cookies_loaded": 0,
-    }
-    active = cookie_info["active_path"]
-    if os.path.exists(active):
-        try:
-            jar = http.cookiejar.MozillaCookieJar(active)
-            jar.load(ignore_discard=True, ignore_expires=True)
-            cookie_info["cookies_loaded"] = len(jar)
-        except Exception as e:
-            cookie_info["cookie_error"] = str(e)
-
-    # Supadata diagnosis
-    supadata_key = os.environ.get("SUPADATA_API_KEY")
-    supadata_info = {
-        "configured": bool(supadata_key),
-        "key_preview": f"{supadata_key[:4]}...{supadata_key[-4:]}" if supadata_key and len(supadata_key) > 8 else "too short/none",
-    }
-
-    return jsonify({
-        "status": "ok",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "cookie_status": cookie_info,
-        "supadata_status": supadata_info,
-    })
-
+    return jsonify({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
 
 @app.route("/api/summarize", methods=["POST"])
 def summarize():
@@ -505,84 +273,44 @@ def summarize():
         gemini_key = data.get("gemini_api_key", "")
         supadata_key = data.get("supadata_api_key", "")
 
-        if not urls:
-            return jsonify({"error": "No URLs provided."}), 400
+        if not urls: return jsonify({"error": "No URLs provided."}), 400
+        if len(urls) > 5: return jsonify({"error": "Maximum 5 URLs allowed."}), 400
+        if not gemini_key: return jsonify({"error": "Gemini API key is required."}), 400
 
-        if len(urls) > 5:
-            return jsonify({"error": "Maximum 5 URLs allowed."}), 400
-
-        if not gemini_key:
-            return jsonify({"error": "Gemini API key is required."}), 400
-
-        # Validate and extract video IDs
         tasks = []
         for url in urls:
             url = url.strip()
-            if not url:
-                continue
+            if not url: continue
             video_id = extract_video_id(url)
             if not video_id:
-                tasks.append({
-                    "url": url,
-                    "error": f"Could not extract video ID from: {url}",
-                })
+                tasks.append({"url": url, "error": f"Could not extract video ID from: {url}"})
             else:
-                tasks.append({
-                    "url": url,
-                    "video_id": video_id,
-                })
+                tasks.append({"url": url, "video_id": video_id})
 
-        # Process videos sequentially
-        import time
         results = []
         valid_tasks = [t for t in tasks if "video_id" in t]
         invalid_tasks = [t for t in tasks if "error" in t]
 
-        for i, task in enumerate(valid_tasks):
+        for task in valid_tasks:
             try:
-                result = process_single_video(
-                    task["video_id"],
-                    task["url"],
-                    gemini_key,
-                    supadata_key=supadata_key,
-                )
+                result = process_single_video(task["video_id"], task["url"], gemini_key, supadata_key=supadata_key)
                 results.append(result)
             except Exception as e:
-                print(f"Error processing video {task['video_id']}: {e}")
-                results.append({
-                    "url": task["url"],
-                    "video_id": task["video_id"],
-                    "error": f"Internal process error: {str(e)}",
-                    "title": "Failed to load"
-                })
-            # Small delay between requests to avoid rate limits
-            if i < len(valid_tasks) - 1:
-                time.sleep(1.0)
+                results.append({"url": task["url"], "video_id": task["video_id"], "error": f"Process error: {str(e)}", "title": "Failed to load"})
 
-        # Add invalid URL errors
         for t in invalid_tasks:
-            results.append({
-                "url": t["url"],
-                "error": t["error"],
-            })
+            results.append({"url": t["url"], "error": t["error"]})
 
-        # Sort results in the same order as input URLs
         url_order = {url.strip(): i for i, url in enumerate(urls)}
         results.sort(key=lambda r: url_order.get(r.get("url", ""), 999))
 
         return jsonify({"results": results})
     
     except Exception as e:
-        print(f"FATAL API ERROR: {e}")
         return jsonify({"error": f"A server-side error occurred: {str(e)}"}), 500
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8082))
     is_dev = "--dev" in sys.argv or os.environ.get("FLASK_ENV") == "development"
-    cookie_file = os.path.join(BASE_DIR, "cookies.txt")
-    cookie_status = "✅ found" if os.path.exists(cookie_file) else "⚠️  not found (transcripts will work without cookies for most videos)"
     print(f"🎬 YouTubeSummarizer server starting on http://localhost:{port}")
-    print(f"   cookies.txt: {cookie_status}")
-    print(f"   Environment: {'🔧 Development' if is_dev else '🚀 Production'}")
     app.run(debug=is_dev, host="0.0.0.0", port=port)
