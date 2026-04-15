@@ -10,8 +10,6 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from youtube_transcript_api import YouTubeTranscriptApi
 import google.generativeai as genai
-
-# For processing multiple videos simultaneously
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Force IPv4 to bypass severe IPv6 DNS routing timeouts
@@ -69,14 +67,12 @@ def _try_fetch_transcript(video_id: str, cookie_file: str = None) -> Optional[li
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, cookies=cookie_file)
         
-        # 1. Try to find a native English transcript (manual or auto-generated)
         try:
             en_transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB', 'en-IN'])
             return en_transcript.fetch()
         except Exception:
             pass # Move to translation phase
         
-        # 2. If no English track exists, find ANY track and translate it to English
         for transcript in transcript_list:
             if transcript.is_translatable:
                 translated = transcript.translate('en')
@@ -128,13 +124,11 @@ def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
     elif os.path.exists(local_cookie_path):
         cookie_file = local_cookie_path
 
-    # ── Tier 1: YouTubeTranscriptApi (Best for Forced Translation) ──
     fetched = _try_fetch_transcript(video_id, cookie_file)
     if fetched:
         debug_info["method"] = "youtube_transcript_api_translated"
         return _format_transcript(fetched, debug_info)
 
-    # ── Tier 2: Supadata (Fallback if blocked) ──
     try:
         active_supadata_key = supadata_key or os.environ.get("SUPADATA_API_KEY")
         if active_supadata_key:
@@ -145,7 +139,6 @@ def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
     except Exception as e:
         debug_info["tier2_error"] = str(e)
 
-    # All tiers failed
     return {
         "error": "Could not extract or translate transcript. Video might lack captions.",
         "segments": [],
@@ -182,18 +175,12 @@ def _format_transcript(snippets, debug_info: dict) -> dict:
         "debug": debug_info,
     }
 
-_working_model_cache = {}
-
-def summarize_transcript(gemini_key: str, title: str, full_text: str) -> str:
-    """Generate an AI summary of the transcript using Gemini with Smart Auto-Discovery."""
-    if not gemini_key:
-        return "No API key provided — cannot generate summary."
+def summarize_transcript(title: str, full_text: str) -> str:
+    """Generate an AI summary of the transcript (API Key must be configured globally first)."""
     if not full_text:
         return "No transcript text available to summarize."
 
     try:
-        genai.configure(api_key=gemini_key)
-
         max_chars = 25000 
         text_to_summarize = full_text[:max_chars]
         if len(full_text) > max_chars:
@@ -220,56 +207,32 @@ Provide your summary in the following format:
 
 Be concise but comprehensive. Focus on the most important information."""
 
-        # 1. Check if we already found a working model for this key
-        if gemini_key in _working_model_cache:
-            try:
-                model = genai.GenerativeModel(_working_model_cache[gemini_key])
-                return model.generate_content(prompt).text.strip()
-            except Exception:
-                # If the cached model suddenly fails, clear it and fall through to discovery
-                del _working_model_cache[gemini_key]
-
-        # 2. Try the standard 1.5 names first (fastest path)
-        known_models = ["gemini-1.5-flash", "gemini-1.5-pro", "models/gemini-1.5-flash"]
-        for model_name in known_models:
-            try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(prompt)
-                _working_model_cache[gemini_key] = model_name # Save the winner
-                return response.text.strip()
-            except Exception as e:
-                # If it's a 404, ignore and try the next one. If it's a real error (like quota), raise it.
-                if "404" in str(e) or "not found" in str(e).lower():
-                    continue
-                raise e 
-
-        # 3. Smart Auto-Discovery: Ask the API for available models if the standard names failed
-        print("⚠️ Standard model names failed. Querying API for available models...")
-        for m in genai.list_models():
-            if "generateContent" in m.supported_generation_methods:
-                model_name = m.name.replace("models/", "") # Clean the prefix
+        # Direct, thread-safe fallback logic
+        try:
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            response = model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            if "404" in str(e) or "not found" in str(e).lower():
                 try:
-                    model = genai.GenerativeModel(model_name)
-                    response = model.generate_content(prompt)
-                    _working_model_cache[gemini_key] = model_name # Save the winner
-                    print(f"✅ Successfully auto-discovered and used model: {model_name}")
+                    fallback_model = genai.GenerativeModel("gemini-pro")
+                    response = fallback_model.generate_content(prompt)
                     return response.text.strip()
                 except Exception:
-                    continue # Try the next one in the list
-
-        return "Summary generation failed: Your API key does not have access to any text-generation models."
+                    return "Summary failed: No compatible Gemini models found for your API key."
+            raise e
 
     except Exception as e:
         return f"Summary generation failed: {str(e)}"
 
-def process_single_video(video_id: str, url: str, gemini_key: str, supadata_key: str = None) -> dict:
+def process_single_video(video_id: str, url: str, supadata_key: str = None) -> dict:
     """Process a single video: fetch metadata, transcript, and summary."""
     metadata = fetch_video_metadata(video_id)
     transcript_data = fetch_transcript(video_id, supadata_key=supadata_key)
 
     summary = ""
     if transcript_data["full_text"]:
-        summary = summarize_transcript(gemini_key, metadata["title"], transcript_data["full_text"])
+        summary = summarize_transcript(metadata["title"], transcript_data["full_text"])
     elif transcript_data["error"]:
         summary = f"⚠️ Could not generate summary: {transcript_data['error']}"
 
@@ -302,7 +265,7 @@ def health_check():
 
 @app.route("/api/summarize", methods=["POST"])
 def summarize():
-    """Accept up to 5 YouTube URLs, fetch transcripts, and return summaries."""
+    """Accept up to 5 YouTube URLs, fetch transcripts, and return summaries concurrently."""
     try:
         data = request.get_json() or {}
         urls = data.get("urls", [])
@@ -312,6 +275,9 @@ def summarize():
         if not urls: return jsonify({"error": "No URLs provided."}), 400
         if len(urls) > 5: return jsonify({"error": "Maximum 5 URLs allowed."}), 400
         if not gemini_key: return jsonify({"error": "Gemini API key is required."}), 400
+
+        # Configure Gemini globally ONCE before starting threads to prevent race conditions
+        genai.configure(api_key=gemini_key)
 
         tasks = []
         for url in urls:
@@ -327,19 +293,20 @@ def summarize():
         valid_tasks = [t for t in tasks if "video_id" in t]
         invalid_tasks = [t for t in tasks if "error" in t]
 
-        # 🚀 Process all valid videos concurrently using parallel threads
-        def process_task(task):
+        # Bulletproof wrapper for the thread executor
+        def safe_process(task):
             try:
-                return process_single_video(task["video_id"], task["url"], gemini_key, supadata_key=supadata_key)
+                return process_single_video(task["video_id"], task["url"], supadata_key=supadata_key)
             except Exception as e:
-                return {"url": task["url"], "video_id": task["video_id"], "error": f"Process error: {str(e)}", "title": "Failed to load"}
+                return {"url": task["url"], "video_id": task["video_id"], "error": f"Thread crashed: {str(e)}", "title": "Failed to load"}
 
-        # Run up to 5 tasks at the exact same time
+        # Run valid tasks concurrently
         with ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_task = {executor.submit(process_task, task): task for task in valid_tasks}
-            for future in as_completed(future_to_task):
+            futures = [executor.submit(safe_process, task) for task in valid_tasks]
+            for future in as_completed(futures):
                 results.append(future.result())
 
+        # Add any tasks that failed validation instantly
         for t in invalid_tasks:
             results.append({"url": t["url"], "error": t["error"]})
 
