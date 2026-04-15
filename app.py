@@ -179,8 +179,10 @@ def _format_transcript(snippets, debug_info: dict) -> dict:
         "debug": debug_info,
     }
 
+_working_model_cache = {}
+
 def summarize_transcript(gemini_key: str, title: str, full_text: str) -> str:
-    """Generate an AI summary of the transcript using Gemini."""
+    """Generate an AI summary of the transcript using Gemini with Smart Auto-Discovery."""
     if not gemini_key:
         return "No API key provided — cannot generate summary."
     if not full_text:
@@ -215,20 +217,45 @@ Provide your summary in the following format:
 
 Be concise but comprehensive. Focus on the most important information."""
 
-        # Attempt to use the faster/cheaper flash model first
-        try:
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            response = model.generate_content(prompt)
-        except Exception as e:
-            # If 1.5-flash throws a 404 error, gracefully fall back to standard gemini-pro
-            if "404" in str(e) or "not found" in str(e).lower():
-                print("⚠️ gemini-1.5-flash not found, falling back to gemini-pro")
-                model = genai.GenerativeModel("gemini-pro")
-                response = model.generate_content(prompt)
-            else:
-                raise e # Raise other unexpected errors
+        # 1. Check if we already found a working model for this key
+        if gemini_key in _working_model_cache:
+            try:
+                model = genai.GenerativeModel(_working_model_cache[gemini_key])
+                return model.generate_content(prompt).text.strip()
+            except Exception:
+                # If the cached model suddenly fails, clear it and fall through to discovery
+                del _working_model_cache[gemini_key]
 
-        return response.text.strip()
+        # 2. Try the standard 1.5 names first (fastest path)
+        known_models = ["gemini-1.5-flash", "gemini-1.5-pro", "models/gemini-1.5-flash"]
+        for model_name in known_models:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(prompt)
+                _working_model_cache[gemini_key] = model_name # Save the winner
+                return response.text.strip()
+            except Exception as e:
+                # If it's a 404, ignore and try the next one. If it's a real error (like quota), raise it.
+                if "404" in str(e) or "not found" in str(e).lower():
+                    continue
+                raise e 
+
+        # 3. Smart Auto-Discovery: Ask the API for available models if the standard names failed
+        print("⚠️ Standard model names failed. Querying API for available models...")
+        for m in genai.list_models():
+            if "generateContent" in m.supported_generation_methods:
+                model_name = m.name.replace("models/", "") # Clean the prefix
+                try:
+                    model = genai.GenerativeModel(model_name)
+                    response = model.generate_content(prompt)
+                    _working_model_cache[gemini_key] = model_name # Save the winner
+                    print(f"✅ Successfully auto-discovered and used model: {model_name}")
+                    return response.text.strip()
+                except Exception:
+                    continue # Try the next one in the list
+
+        return "Summary generation failed: Your API key does not have access to any text-generation models."
+
     except Exception as e:
         return f"Summary generation failed: {str(e)}"
 
