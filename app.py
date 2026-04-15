@@ -11,6 +11,9 @@ from flask_cors import CORS
 from youtube_transcript_api import YouTubeTranscriptApi
 import google.generativeai as genai
 
+# For processing multiple videos simultaneously
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 # Force IPv4 to bypass severe IPv6 DNS routing timeouts
 def allowed_gai_family():
     return socket.AF_INET
@@ -324,16 +327,23 @@ def summarize():
         valid_tasks = [t for t in tasks if "video_id" in t]
         invalid_tasks = [t for t in tasks if "error" in t]
 
-        for task in valid_tasks:
+        # 🚀 Process all valid videos concurrently using parallel threads
+        def process_task(task):
             try:
-                result = process_single_video(task["video_id"], task["url"], gemini_key, supadata_key=supadata_key)
-                results.append(result)
+                return process_single_video(task["video_id"], task["url"], gemini_key, supadata_key=supadata_key)
             except Exception as e:
-                results.append({"url": task["url"], "video_id": task["video_id"], "error": f"Process error: {str(e)}", "title": "Failed to load"})
+                return {"url": task["url"], "video_id": task["video_id"], "error": f"Process error: {str(e)}", "title": "Failed to load"}
+
+        # Run up to 5 tasks at the exact same time
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_task = {executor.submit(process_task, task): task for task in valid_tasks}
+            for future in as_completed(future_to_task):
+                results.append(future.result())
 
         for t in invalid_tasks:
             results.append({"url": t["url"], "error": t["error"]})
 
+        # Restore the original order the user entered them in
         url_order = {url.strip(): i for i, url in enumerate(urls)}
         results.sort(key=lambda r: url_order.get(r.get("url", ""), 999))
 
