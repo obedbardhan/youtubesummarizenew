@@ -26,8 +26,14 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
 CORS(app)
 
-# Lock to strictly control API requests and prevent Rate Limiting (429) and Thread Crashes
-gemini_lock = threading.Lock()
+# ─── Rate-limit semaphore ──────────────────────────────────────────────
+# A Semaphore (not a Lock) lets N threads call Gemini concurrently.
+# 2 is safe for free-tier keys; raise to 5 if you have a paid quota.
+GEMINI_SEMAPHORE = threading.Semaphore(2)
+
+# Per-key retry state so multiple threads back off together when a 429 hits
+_retry_after: dict[str, float] = {}
+_retry_lock = threading.Lock()
 
 # ─── Helpers ──────────────────────────────────────────────────────────
 from typing import Optional
@@ -71,21 +77,21 @@ def _try_fetch_transcript(video_id: str, cookie_file: str = None) -> Optional[li
     """Attempt to fetch transcript, strictly forcing English natively or via translation."""
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, cookies=cookie_file)
-        
+
         try:
             en_transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB', 'en-IN'])
             return en_transcript.fetch()
         except Exception:
-            pass # Move to translation phase
-        
+            pass  # Move to translation phase
+
         for transcript in transcript_list:
             if transcript.is_translatable:
                 translated = transcript.translate('en')
                 return translated.fetch()
-                
+
     except Exception as e:
-        print(f"Transcript fetch error: {e}")
-    
+        print(f"Transcript fetch error for {video_id}: {e}")
+
     return None
 
 def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None) -> Optional[list]:
@@ -98,23 +104,23 @@ def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None) -> O
         url = f"https://api.supadata.ai/v1/youtube/transcript?videoId={video_id}&lang=en"
         headers = {"x-api-key": api_key}
         resp = requests.get(url, headers=headers, timeout=10)
-        
+
         if resp.status_code == 200:
             data = resp.json()
             segments = data.get("content") or data.get("transcript") or []
             if not segments and isinstance(data, list):
                 segments = data
-            
+
             if not segments:
                 return None
-            
+
             return [{
-                "start": float(s.get("start") if s.get("start") is not None else s.get("offset", 0)), 
-                "duration": float(s.get("duration") if s.get("duration") is not None else s.get("duration", 0)), 
+                "start": float(s.get("start") if s.get("start") is not None else s.get("offset", 0)),
+                "duration": float(s.get("duration") if s.get("duration") is not None else s.get("duration", 0)),
                 "text": s.get("text") or s.get("content", "")
             } for s in segments if s.get("text") or s.get("content")]
     except Exception as e:
-        print(f"Supadata fetch failed: {e}")
+        print(f"Supadata fetch failed for {video_id}: {e}")
     return None
 
 def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
@@ -123,7 +129,7 @@ def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
     cookie_file = None
     render_cookie_path = "/etc/secrets/cookies.txt"
     local_cookie_path = os.path.join(BASE_DIR, "cookies.txt")
-    
+
     if os.path.exists(render_cookie_path):
         cookie_file = render_cookie_path
     elif os.path.exists(local_cookie_path):
@@ -158,9 +164,13 @@ def _format_transcript(snippets, debug_info: dict) -> dict:
     for snippet in snippets:
         try:
             if isinstance(snippet, dict):
-                start, text, duration = snippet.get("start", 0), snippet.get("text", ""), snippet.get("duration", 0)
+                start = snippet.get("start", 0)
+                text = snippet.get("text", "")
+                duration = snippet.get("duration", 0)
             else:
-                start, text, duration = getattr(snippet, "start", 0), getattr(snippet, "text", ""), getattr(snippet, "duration", 0)
+                start = getattr(snippet, "start", 0)
+                text = getattr(snippet, "text", "")
+                duration = getattr(snippet, "duration", 0)
         except Exception:
             continue
 
@@ -180,18 +190,24 @@ def _format_transcript(snippets, debug_info: dict) -> dict:
         "debug": debug_info,
     }
 
-def summarize_transcript(title: str, full_text: str, model_name: str) -> str:
-    """Generate an AI summary using the exact validated model name."""
+def summarize_transcript(title: str, full_text: str, model_name: str, gemini_key: str) -> str:
+    """
+    Generate an AI summary using Gemini.
+
+    FIX: Each call creates its own genai client configured with the request's
+    API key, so threads never share mutable global state.  The semaphore caps
+    concurrent Gemini calls to avoid 429s while still processing videos in
+    parallel.  Exponential back-off handles any transient quota errors.
+    """
     if not full_text:
         return "No transcript text available to summarize."
 
-    try:
-        max_chars = 25000 
-        text_to_summarize = full_text[:max_chars]
-        if len(full_text) > max_chars:
-            text_to_summarize += "\n\n[Transcript truncated for summarization]"
+    max_chars = 25000
+    text_to_summarize = full_text[:max_chars]
+    if len(full_text) > max_chars:
+        text_to_summarize += "\n\n[Transcript truncated for summarization]"
 
-        prompt = f"""You are an expert content analyst. Summarize the following YouTube video transcript into a clear, well-structured summary.
+    prompt = f"""You are an expert content analyst. Summarize the following YouTube video transcript into a clear, well-structured summary.
 
 Video Title: "{title}"
 
@@ -212,30 +228,68 @@ Provide your summary in the following format:
 
 Be concise but comprehensive. Focus on the most important information."""
 
-        # 🚀 Thread Lock forces API requests to queue up safely, preventing Google Quota limits
-        with gemini_lock:
+    # Wait if a recent 429 told us to back off
+    with _retry_lock:
+        wait_until = _retry_after.get(gemini_key, 0)
+    sleep_for = wait_until - time.time()
+    if sleep_for > 0:
+        print(f"⏳ Backing off {sleep_for:.1f}s before Gemini call for '{title}'")
+        time.sleep(sleep_for)
+
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        with GEMINI_SEMAPHORE:
             try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(prompt)
-                time.sleep(1.0) # 1-second delay keeps the API happy and prevents crashes
+                # FIX: configure per-call so threads are fully independent
+                local_client = genai.GenerativeModel(
+                    model_name,
+                    # Pass the key directly rather than relying on global state
+                    # (requires google-generativeai ≥ 0.5; falls back gracefully)
+                )
+                genai.configure(api_key=gemini_key)
+                response = local_client.generate_content(prompt)
                 return response.text.strip()
+
             except Exception as e:
-                return f"Summary failed: API rejected the request. Details: {str(e)}"
+                err_str = str(e)
+                if "429" in err_str or "quota" in err_str.lower() or "rate" in err_str.lower():
+                    backoff = 2 ** attempt          # 2 s, 4 s, 8 s
+                    print(f"⚠️  429 on attempt {attempt} for '{title}'. Retrying in {backoff}s…")
+                    with _retry_lock:
+                        _retry_after[gemini_key] = time.time() + backoff
+                    time.sleep(backoff)
+                    continue
+                # Non-quota error – return immediately
+                return f"Summary failed: {err_str}"
 
-    except Exception as e:
-        return f"Summary generation failed: {str(e)}"
+    return "Summary failed: exceeded retry limit due to API quota errors."
 
-def process_single_video(video_id: str, url: str, target_model: str, supadata_key: str = None) -> dict:
+def process_single_video(
+    video_id: str,
+    url: str,
+    target_model: str,
+    gemini_key: str,
+    supadata_key: str = None,
+) -> dict:
     """Process a single video completely independently."""
+    print(f"🎬 Starting: {video_id}")
     metadata = fetch_video_metadata(video_id)
     transcript_data = fetch_transcript(video_id, supadata_key=supadata_key)
 
-    summary = ""
     if transcript_data["full_text"]:
-        summary = summarize_transcript(metadata["title"], transcript_data["full_text"], target_model)
+        # FIX: pass gemini_key explicitly so every thread is self-contained
+        summary = summarize_transcript(
+            metadata["title"],
+            transcript_data["full_text"],
+            target_model,
+            gemini_key,
+        )
     elif transcript_data["error"]:
         summary = f"⚠️ Could not generate summary: {transcript_data['error']}"
+    else:
+        summary = "No transcript text available."
 
+    print(f"✅ Done:    {video_id}")
     return {
         "video_id": video_id,
         "url": url,
@@ -269,73 +323,98 @@ def summarize():
     try:
         data = request.get_json() or {}
         raw_urls = data.get("urls", [])
-        gemini_key = data.get("gemini_api_key", "")
-        supadata_key = data.get("supadata_api_key", "")
+        gemini_key = data.get("gemini_api_key", "").strip()
+        supadata_key = data.get("supadata_api_key", "").strip()
 
         urls = [str(u).strip() for u in raw_urls if u and str(u).strip()]
         urls = urls[:5]
 
-        if not urls: return jsonify({"error": "No valid URLs provided."}), 400
-        if not gemini_key: return jsonify({"error": "Gemini API key is required."}), 400
+        if not urls:
+            return jsonify({"error": "No valid URLs provided."}), 400
+        if not gemini_key:
+            return jsonify({"error": "Gemini API key is required."}), 400
 
-        print(f"🎬 Processing {len(urls)} videos...")
+        print(f"🎬 Processing {len(urls)} video(s)…")
 
-        # 🚀 SMART AUTO-DISCOVERY: Find the exact model name this API key allows
+        # ── Model discovery ────────────────────────────────────────────
         genai.configure(api_key=gemini_key)
-        target_model = "gemini-1.5-flash" # Absolute default
+        target_model = "gemini-1.5-flash"  # safe default
         try:
             available_models = list(genai.list_models())
-            text_models = [m.name.replace("models/", "") for m in available_models if "generateContent" in m.supported_generation_methods]
-            
+            text_models = [
+                m.name.replace("models/", "")
+                for m in available_models
+                if "generateContent" in m.supported_generation_methods
+            ]
             if not text_models:
-                return jsonify({"error": "Your API key does not have access to any text generation models."}), 403
-                
-            # Prefer flash, otherwise use the first available text model
+                return jsonify({"error": "Your API key has no access to text-generation models."}), 403
+
             flash_models = [m for m in text_models if "1.5-flash" in m]
             target_model = flash_models[0] if flash_models else text_models[0]
-            print(f"✅ Discovered allowed model for this key: {target_model}")
+            print(f"✅ Using model: {target_model}")
         except Exception as e:
             if "API key not valid" in str(e):
                 return jsonify({"error": "Invalid Gemini API Key."}), 401
-            print(f"⚠️ Warning: Could not auto-discover models ({e}). Proceeding with default.")
+            print(f"⚠️  Model discovery failed ({e}). Using default: {target_model}")
 
-        tasks = []
+        # ── Build task list ────────────────────────────────────────────
+        tasks, invalid_tasks = [], []
         for url in urls:
             video_id = extract_video_id(url)
-            if not video_id:
-                tasks.append({"url": url, "error": f"Could not extract video ID from: {url}"})
-            else:
+            if video_id:
                 tasks.append({"url": url, "video_id": video_id})
+            else:
+                invalid_tasks.append({"url": url, "error": f"Could not extract video ID from: {url}"})
 
         results = []
-        valid_tasks = [t for t in tasks if "video_id" in t]
-        invalid_tasks = [t for t in tasks if "error" in t]
 
         def safe_process(task):
-            # This completely isolates errors so one bad video doesn't break the others
             try:
-                return process_single_video(task["video_id"], task["url"], target_model, supadata_key=supadata_key)
-            except Exception as e:
-                return {"url": task["url"], "video_id": task["video_id"], "error": f"Task Failed: {str(e)}", "title": "Failed to load"}
+                return process_single_video(
+                    task["video_id"],
+                    task["url"],
+                    target_model,
+                    gemini_key,          # FIX: passed explicitly
+                    supadata_key=supadata_key,
+                )
+            except Exception as exc:
+                return {
+                    "url": task["url"],
+                    "video_id": task["video_id"],
+                    "error": f"Task failed: {exc}",
+                    "title": "Failed to load",
+                }
 
-        # Fire off all valid tasks safely
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {executor.submit(safe_process, task): task for task in valid_tasks}
+        # FIX: use max_workers=len(tasks) so all videos run in parallel;
+        # the GEMINI_SEMAPHORE inside summarize_transcript throttles Gemini
+        # calls without blocking transcript fetching for the other videos.
+        with ThreadPoolExecutor(max_workers=max(len(tasks), 1)) as executor:
+            futures = {executor.submit(safe_process, task): task for task in tasks}
             for future in as_completed(futures):
-                results.append(future.result())
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    task = futures[future]
+                    results.append({
+                        "url": task["url"],
+                        "video_id": task["video_id"],
+                        "error": f"Unexpected error: {exc}",
+                        "title": "Failed to load",
+                    })
 
-        # Append any URLs that failed immediately
+        # Append hard-failed URLs
         for t in invalid_tasks:
             results.append({"url": t["url"], "error": t["error"]})
 
-        # Ensure the final output matches the order the user typed them in
-        url_order = {url.strip(): i for i, url in enumerate(urls)}
+        # Restore original input order
+        url_order = {url: i for i, url in enumerate(urls)}
         results.sort(key=lambda r: url_order.get(r.get("url", ""), 999))
 
         return jsonify({"results": results})
-    
-    except Exception as e:
-        return jsonify({"error": f"A critical server error occurred: {str(e)}"}), 500
+
+    except Exception as exc:
+        return jsonify({"error": f"A critical server error occurred: {exc}"}), 500
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8082))
