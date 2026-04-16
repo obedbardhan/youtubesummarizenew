@@ -264,20 +264,33 @@ Be concise but comprehensive. Focus on the most important information."""
 
     return "Summary failed: exceeded retry limit due to API quota errors."
 
-def process_single_video(
-    video_id: str,
-    url: str,
-    target_model: str,
-    gemini_key: str,
-    supadata_key: str = None,
-) -> dict:
-    """Process a single video completely independently."""
-    print(f"🎬 Starting: {video_id}")
+def fetch_video_data(video_id: str, url: str, supadata_key: str = None) -> dict:
+    """
+    Phase 1 (sequential): fetch metadata + transcript for one video.
+    No Gemini calls here — safe to run one-at-a-time to avoid YouTube
+    rate-limiting parallel scrape attempts from the same IP.
+    """
+    print(f"📥 Fetching transcript: {video_id}")
     metadata = fetch_video_metadata(video_id)
     transcript_data = fetch_transcript(video_id, supadata_key=supadata_key)
+    return {
+        "video_id": video_id,
+        "url": url,
+        "metadata": metadata,
+        "transcript_data": transcript_data,
+    }
+
+def summarize_video_data(fetched: dict, target_model: str, gemini_key: str) -> dict:
+    """
+    Phase 2 (parallel): run Gemini summarization on already-fetched data.
+    Safe to parallelize because it makes no YouTube requests.
+    """
+    video_id = fetched["video_id"]
+    url = fetched["url"]
+    metadata = fetched["metadata"]
+    transcript_data = fetched["transcript_data"]
 
     if transcript_data["full_text"]:
-        # FIX: pass gemini_key explicitly so every thread is self-contained
         summary = summarize_transcript(
             metadata["title"],
             transcript_data["full_text"],
@@ -289,7 +302,7 @@ def process_single_video(
     else:
         summary = "No transcript text available."
 
-    print(f"✅ Done:    {video_id}")
+    print(f"✅ Done: {video_id}")
     return {
         "video_id": video_id,
         "url": url,
@@ -368,36 +381,52 @@ def summarize():
 
         results = []
 
-        def safe_process(task):
+        # ── Phase 1: fetch transcripts SEQUENTIALLY ────────────────────
+        # YouTube's transcript API blocks concurrent requests from the same
+        # IP (treats them as scraping). Fetching one-at-a-time with a small
+        # pause between requests is the only reliable fix.
+        fetched_videos = []
+        for task in tasks:
             try:
-                return process_single_video(
-                    task["video_id"],
-                    task["url"],
-                    target_model,
-                    gemini_key,          # FIX: passed explicitly
-                    supadata_key=supadata_key,
+                fetched = fetch_video_data(
+                    task["video_id"], task["url"], supadata_key=supadata_key
                 )
+                fetched_videos.append(fetched)
             except Exception as exc:
-                return {
+                results.append({
                     "url": task["url"],
                     "video_id": task["video_id"],
-                    "error": f"Task failed: {exc}",
+                    "error": f"Transcript fetch failed: {exc}",
                     "title": "Failed to load",
+                })
+            # Small polite delay between YouTube requests
+            if len(tasks) > 1:
+                time.sleep(1.5)
+
+        # ── Phase 2: summarize IN PARALLEL ────────────────────────────
+        # Gemini calls are independent HTTP requests; parallelizing them is
+        # safe and cuts total wait time significantly for multiple videos.
+        def safe_summarize(fetched):
+            try:
+                return summarize_video_data(fetched, target_model, gemini_key)
+            except Exception as exc:
+                return {
+                    "url": fetched["url"],
+                    "video_id": fetched["video_id"],
+                    "error": f"Summarization failed: {exc}",
+                    "title": fetched["metadata"].get("title", "Failed to load"),
                 }
 
-        # FIX: use max_workers=len(tasks) so all videos run in parallel;
-        # the GEMINI_SEMAPHORE inside summarize_transcript throttles Gemini
-        # calls without blocking transcript fetching for the other videos.
-        with ThreadPoolExecutor(max_workers=max(len(tasks), 1)) as executor:
-            futures = {executor.submit(safe_process, task): task for task in tasks}
+        with ThreadPoolExecutor(max_workers=max(len(fetched_videos), 1)) as executor:
+            futures = {executor.submit(safe_summarize, f): f for f in fetched_videos}
             for future in as_completed(futures):
                 try:
                     results.append(future.result())
                 except Exception as exc:
-                    task = futures[future]
+                    f = futures[future]
                     results.append({
-                        "url": task["url"],
-                        "video_id": task["video_id"],
+                        "url": f["url"],
+                        "video_id": f["video_id"],
                         "error": f"Unexpected error: {exc}",
                         "title": "Failed to load",
                     })
