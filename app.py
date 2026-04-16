@@ -445,7 +445,134 @@ def summarize():
         return jsonify({"error": f"A critical server error occurred: {exc}"}), 500
 
 
-if __name__ == "__main__":
+@app.route("/api/summarize/stream", methods=["POST"])
+def summarize_stream():
+    """
+    SSE endpoint: streams one JSON result per video as it completes.
+    This keeps the HTTP connection alive for long videos and lets the
+    frontend render cards progressively — no more Render 30 s timeouts.
+    """
+    try:
+        data = request.get_json() or {}
+        raw_urls = data.get("urls", [])
+        gemini_key = data.get("gemini_api_key", "").strip()
+        supadata_key = data.get("supadata_api_key", "").strip()
+
+        urls = [str(u).strip() for u in raw_urls if u and str(u).strip()]
+        urls = urls[:5]
+
+        if not urls:
+            return jsonify({"error": "No valid URLs provided."}), 400
+        if not gemini_key:
+            return jsonify({"error": "Gemini API key is required."}), 400
+
+        # ── Model discovery (done once, before streaming starts) ───────
+        genai.configure(api_key=gemini_key)
+        target_model = "gemini-1.5-flash"
+        try:
+            available_models = list(genai.list_models())
+            text_models = [
+                m.name.replace("models/", "")
+                for m in available_models
+                if "generateContent" in m.supported_generation_methods
+            ]
+            if not text_models:
+                return jsonify({"error": "Your API key has no access to text-generation models."}), 403
+            flash_models = [m for m in text_models if "1.5-flash" in m]
+            target_model = flash_models[0] if flash_models else text_models[0]
+            print(f"✅ Using model: {target_model}")
+        except Exception as e:
+            if "API key not valid" in str(e):
+                return jsonify({"error": "Invalid Gemini API Key."}), 401
+            print(f"⚠️  Model discovery failed ({e}). Using default: {target_model}")
+
+        # ── Build task list ────────────────────────────────────────────
+        tasks = []
+        for url in urls:
+            video_id = extract_video_id(url)
+            if video_id:
+                tasks.append({"url": url, "video_id": video_id})
+            else:
+                tasks.append({"url": url, "video_id": None})
+
+        def generate():
+            import json as _json
+
+            # Phase 1 — sequential transcript fetching (YouTube blocks parallel)
+            fetched_videos = []
+            for i, task in enumerate(tasks):
+                if task["video_id"] is None:
+                    # Immediately stream an error result for bad URLs
+                    err_result = {
+                        "url": task["url"],
+                        "error": f"Could not extract video ID from: {task['url']}",
+                        "title": None,
+                    }
+                    yield f"data: {_json.dumps({'type': 'result', 'data': err_result})}\n\n"
+                    continue
+
+                try:
+                    fetched = fetch_video_data(
+                        task["video_id"], task["url"], supadata_key=supadata_key
+                    )
+                    fetched_videos.append(fetched)
+                except Exception as exc:
+                    err_result = {
+                        "url": task["url"],
+                        "video_id": task["video_id"],
+                        "error": f"Transcript fetch failed: {exc}",
+                        "title": "Failed to load",
+                    }
+                    yield f"data: {_json.dumps({'type': 'result', 'data': err_result})}\n\n"
+
+                # Polite delay between YouTube requests
+                if i < len(tasks) - 1:
+                    time.sleep(1.5)
+
+            # Phase 2 — parallel Gemini summarization; stream each result
+            # as it finishes so the frontend can render cards immediately.
+            if not fetched_videos:
+                yield "data: [DONE]\n\n"
+                return
+
+            result_queue = __import__("queue").Queue()
+
+            def summarize_and_enqueue(fetched):
+                try:
+                    result = summarize_video_data(fetched, target_model, gemini_key)
+                except Exception as exc:
+                    result = {
+                        "url": fetched["url"],
+                        "video_id": fetched["video_id"],
+                        "error": f"Summarization failed: {exc}",
+                        "title": fetched["metadata"].get("title", "Failed to load"),
+                    }
+                result_queue.put(result)
+
+            with ThreadPoolExecutor(max_workers=max(len(fetched_videos), 1)) as executor:
+                for fv in fetched_videos:
+                    executor.submit(summarize_and_enqueue, fv)
+
+                for _ in fetched_videos:
+                    result = result_queue.get()
+                    yield f"data: {_json.dumps({'type': 'result', 'data': result})}\n\n"
+
+            yield "data: [DONE]\n\n"
+
+        return app.response_class(
+            generate(),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",   # disables Nginx/Render proxy buffering
+            },
+        )
+
+    except Exception as exc:
+        return jsonify({"error": f"A critical server error occurred: {exc}"}), 500
+
+
+
     port = int(os.environ.get("PORT", 8082))
     is_dev = "--dev" in sys.argv or os.environ.get("FLASK_ENV") == "development"
     print(f"🎬 YouTubeSummarizer server starting on http://localhost:{port}")
