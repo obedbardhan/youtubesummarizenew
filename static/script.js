@@ -165,6 +165,7 @@ function isValidYouTubeUrl(url) {
         /(?:youtu\.be\/)([\w-]{11})/,
         /(?:youtube\.com\/embed\/)([\w-]{11})/,
         /(?:youtube\.com\/shorts\/)([\w-]{11})/,
+        /(?:youtube\.com\/live\/)([\w-]{11})/,
         /^[\w-]{11}$/,
     ];
     return patterns.some((p) => p.test(url));
@@ -220,45 +221,121 @@ async function handleSummarize() {
     document.querySelector(".input-section").style.display = "none";
     resultsSection.style.display = "none";
     loadingSection.style.display = "block";
-    loadingText.textContent = `Fetching transcripts and generating summaries for ${urls.length} video${urls.length > 1 ? "s" : ""}...`;
+    loadingText.textContent = `Processing ${urls.length} video${urls.length > 1 ? "s" : ""}...`;
+
+    const supadataKey = localStorage.getItem(SUPADATA_KEY_STORAGE_KEY) || "";
+
+    // Ordered placeholders so results appear in input order
+    const orderedResults = new Array(urls.length).fill(null);
+    let completed = 0;
+    window.currentResults = [];
+
+    // Show results section early so cards stream in
+    resultsContainer.innerHTML = "";
+    resultsSection.style.display = "block";
+
+    // Pre-render skeleton cards in input order
+    urls.forEach((url, i) => {
+        const skeleton = document.createElement("div");
+        skeleton.className = "video-card skeleton-card";
+        skeleton.id = `skeleton-${i}`;
+        skeleton.innerHTML = `
+            <div class="video-card-header" style="opacity:0.4">
+                <div style="width:120px;height:68px;background:var(--surface-2);border-radius:8px;flex-shrink:0"></div>
+                <div style="flex:1;padding:8px 0">
+                    <div style="height:14px;background:var(--surface-2);border-radius:4px;margin-bottom:10px;width:70%"></div>
+                    <div style="height:11px;background:var(--surface-2);border-radius:4px;width:40%"></div>
+                </div>
+            </div>
+            <div style="padding:20px;text-align:center;color:var(--text-muted);font-size:13px">
+                <div class="loading-spinner" style="width:24px;height:24px;margin:0 auto 10px"></div>
+                Processing…
+            </div>`;
+        resultsContainer.appendChild(skeleton);
+    });
 
     try {
-        const supadataKey = localStorage.getItem(SUPADATA_KEY_STORAGE_KEY);
-        const response = await fetch("/api/summarize", {
+        const response = await fetch("/api/summarize/stream", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                urls: urls,
+                urls,
                 gemini_api_key: geminiKey,
                 supadata_api_key: supadataKey,
             }),
         });
 
-        const contentType = response.headers.get("content-type");
-        if (!contentType || !contentType.includes("application/json")) {
-            const text = await response.text();
-            console.error("Non-JSON response received:", text);
-            throw new Error(`Server returned an invalid response (Format: ${contentType || 'unknown'}). This usually happens due to a server timeout or crash.`);
-        }
-
-        const data = await response.json();
-
         if (!response.ok) {
-            throw new Error(data.error || `Server Error (${response.status})`);
+            const errData = await response.json().catch(() => ({}));
+            throw new Error(errData.error || `Server error ${response.status}`);
         }
 
-        if (!data.results) {
-            throw new Error("Server returned success but no result data found.");
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop(); // keep incomplete line
+
+            for (const line of lines) {
+                if (!line.startsWith("data: ")) continue;
+                const raw = line.slice(6).trim();
+                if (!raw || raw === "[DONE]") continue;
+
+                let event;
+                try { event = JSON.parse(raw); } catch { continue; }
+
+                if (event.type === "error") {
+                    showToast(event.message, "error");
+                    continue;
+                }
+
+                if (event.type === "result") {
+                    const result = event.data;
+                    // Find which input slot this URL belongs to
+                    const idx = urls.indexOf(result.url);
+                    const slotIdx = idx === -1 ? completed : idx;
+
+                    orderedResults[slotIdx] = result;
+                    completed++;
+
+                    // Replace skeleton with real card
+                    const skeleton = document.getElementById(`skeleton-${slotIdx}`);
+                    const card = result.error && !result.title
+                        ? createErrorCard(result)
+                        : createVideoCard(result, slotIdx);
+
+                    if (skeleton) {
+                        skeleton.replaceWith(card);
+                    } else {
+                        resultsContainer.appendChild(card);
+                    }
+
+                    loadingText.textContent = `Processed ${completed} of ${urls.length} video${urls.length > 1 ? "s" : ""}…`;
+                }
+            }
         }
 
-        renderResults(data.results);
+        // Finalise global results in original order
+        window.currentResults = orderedResults.filter(Boolean);
+
+        if (completed === 0) throw new Error("No results returned from server.");
 
     } catch (error) {
-        console.error("Fetch Error:", error);
-        showToast(`${error.message}`, "error");
+        console.error("Stream error:", error);
+        showToast(error.message, "error");
         document.querySelector(".input-section").style.display = "block";
+        resultsSection.style.display = "none";
     } finally {
         loadingSection.style.display = "none";
+        if (completed > 0) {
+            resultsSection.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
     }
 }
 
