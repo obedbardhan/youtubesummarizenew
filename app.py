@@ -181,7 +181,7 @@ def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None):
         # ── Immediate result ──────────────────────────────────────────
         if resp.status_code == 200:
             segs = _parse_segments(resp.json())
-        return (segs, None) if segs else (None, f"200_but_empty_content")
+            return (segs, None) if segs else (None, "200_but_empty_content")
 
         # ── Async job issued ──────────────────────────────────────────
         if resp.status_code == 202:
