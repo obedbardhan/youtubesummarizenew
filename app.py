@@ -76,54 +76,76 @@ def fetch_video_metadata(video_id: str) -> dict:
         "thumbnail": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
     }
 
+def _build_yt_api() -> YouTubeTranscriptApi:
+    """
+    Build a YouTubeTranscriptApi instance, using a Webshare residential proxy
+    if credentials are configured via environment variables.
+    This is the recommended way to bypass YouTube IP blocks on cloud providers.
+
+    Set these env vars in Render to enable:
+      WEBSHARE_PROXY_USERNAME  — from https://dashboard.webshare.io/proxy/settings
+      WEBSHARE_PROXY_PASSWORD  — from https://dashboard.webshare.io/proxy/settings
+    Make sure you purchased a "Residential" package (NOT "Proxy Server").
+    """
+    ws_user = os.environ.get("WEBSHARE_PROXY_USERNAME", "").strip()
+    ws_pass = os.environ.get("WEBSHARE_PROXY_PASSWORD", "").strip()
+
+    if ws_user and ws_pass:
+        try:
+            from youtube_transcript_api.proxies import WebshareProxyConfig
+            proxy_config = WebshareProxyConfig(
+                proxy_username=ws_user,
+                proxy_password=ws_pass,
+            )
+            print(f"Using Webshare proxy for YouTube requests")
+            return YouTubeTranscriptApi(proxy_config=proxy_config)
+        except Exception as e:
+            print(f"Webshare proxy setup failed: {e}, falling back to direct")
+
+    return YouTubeTranscriptApi()
+
+
+def _snippets_to_dicts(fetched) -> list:
+    """Convert FetchedTranscript snippets to plain dicts."""
+    return [{"text": s.text, "start": s.start, "duration": s.duration}
+            for s in fetched.snippets]
+
+
 def _try_fetch_transcript(video_id: str, cookie_file: str = None) -> Optional[list]:
     """
     Fetch transcript using youtube-transcript-api v1.0+ instance API.
-
-    v1.0 breaking change: static methods removed.
-    New API: YouTubeTranscriptApi().list(video_id) and .fetch(video_id, languages=[...])
+    Uses Webshare proxy if WEBSHARE_PROXY_USERNAME/PASSWORD env vars are set.
 
     Strategies:
     1. Direct fetch with English language preference (fastest path)
     2. List all transcripts, try translating each to English
-    3. Fetch raw (non-English) as last resort
+    3. Fetch any raw transcript as last resort
     """
     try:
-        api = YouTubeTranscriptApi()
-        proxies = None  # Add proxy config here if needed later
+        api = _build_yt_api()
+        en_codes = ["en", "en-US", "en-GB", "en-IN", "en-AU", "en-CA"]
 
-        # ── Strategy 1: direct fetch preferring English variants ──────
-        en_codes = ['en', 'en-US', 'en-GB', 'en-IN', 'en-AU', 'en-CA']
+        # ── Strategy 1: direct English fetch ──────────────────────────
         try:
-            fetched = api.fetch(video_id, languages=en_codes)
-            # v1.0 returns a FetchedTranscript object; convert to list of dicts
-            return [{"text": s.text, "start": s.start, "duration": s.duration}
-                    for s in fetched.snippets]
+            return _snippets_to_dicts(api.fetch(video_id, languages=en_codes))
         except Exception:
-            pass  # No English transcript — try translation
+            pass
 
-        # ── Strategy 2: list all, translate each to English ───────────
+        # ── Strategy 2 & 3: list → translate → raw fallback ───────────
         try:
-            transcript_list = api.list(video_id)
-            all_transcripts = list(transcript_list)
-
-            # Try manual transcripts first, then auto-generated
+            all_transcripts = list(api.list(video_id))
             ordered = sorted(all_transcripts, key=lambda t: t.is_generated)
+
             for t in ordered:
                 try:
-                    translated = t.translate("en").fetch()
-                    return [{"text": s.text, "start": s.start, "duration": s.duration}
-                            for s in translated.snippets]
+                    return _snippets_to_dicts(t.translate("en").fetch())
                 except Exception:
                     continue
 
-            # ── Strategy 3: fetch any raw transcript ──────────────────
             for t in all_transcripts:
                 try:
-                    print(f"Falling back to raw {t.language_code} for {video_id}")
-                    raw = t.fetch()
-                    return [{"text": s.text, "start": s.start, "duration": s.duration}
-                            for s in raw.snippets]
+                    print(f"Raw {t.language_code} fallback for {video_id}")
+                    return _snippets_to_dicts(t.fetch())
                 except Exception:
                     continue
 
@@ -466,7 +488,12 @@ def debug_transcript():
     if not video_id:
         return jsonify({"error": "Pass ?video_id=VIDEO_ID"}), 400
 
-    report = {"video_id": video_id, "steps": {}}
+    ws_user = os.environ.get("WEBSHARE_PROXY_USERNAME", "")
+    report = {
+        "video_id": video_id,
+        "proxy": "webshare" if ws_user else "none (set WEBSHARE_PROXY_USERNAME + WEBSHARE_PROXY_PASSWORD to fix IP blocks)",
+        "steps": {},
+    }
 
     # Step 1: youtube_transcript_api (v1.0+ instance API)
     try:
