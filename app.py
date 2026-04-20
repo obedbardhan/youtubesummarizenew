@@ -114,12 +114,12 @@ def _snippets_to_dicts(fetched) -> list:
 def _try_fetch_transcript(video_id: str, cookie_file: str = None) -> Optional[list]:
     """
     Fetch transcript using youtube-transcript-api v1.0+ instance API.
-    Uses Webshare proxy if WEBSHARE_PROXY_USERNAME/PASSWORD env vars are set.
+    Always returns English — translates non-English transcripts via YouTube.
 
     Strategies:
-    1. Direct fetch with English language preference (fastest path)
-    2. List all transcripts, try translating each to English
-    3. Fetch any raw transcript as last resort
+    1. Direct fetch with English language codes (native English videos)
+    2. List all transcripts, translate EVERY one to English (catches Hindi etc.)
+    3. Raw fallback only if translation fails for every available transcript
     """
     try:
         api = _build_yt_api()
@@ -127,25 +127,44 @@ def _try_fetch_transcript(video_id: str, cookie_file: str = None) -> Optional[li
 
         # ── Strategy 1: direct English fetch ──────────────────────────
         try:
-            return _snippets_to_dicts(api.fetch(video_id, languages=en_codes))
+            result = _snippets_to_dicts(api.fetch(video_id, languages=en_codes))
+            if result:
+                return result
         except Exception:
             pass
 
-        # ── Strategy 2 & 3: list → translate → raw fallback ───────────
+        # ── Strategy 2: list all → translate each to English ──────────
+        # This is the critical path for non-English videos (Hindi, Spanish etc.)
+        # We MUST try translate() on every transcript — including auto-generated —
+        # because is_translatable can be False yet translate() still succeeds.
         try:
             all_transcripts = list(api.list(video_id))
+            if not all_transcripts:
+                return None
+
+            # Try manual transcripts first (better quality), then auto-generated
             ordered = sorted(all_transcripts, key=lambda t: t.is_generated)
 
             for t in ordered:
                 try:
-                    return _snippets_to_dicts(t.translate("en").fetch())
+                    translated = t.translate("en").fetch()
+                    result = _snippets_to_dicts(translated)
+                    if result:
+                        print(f"Translated {t.language_code}→en for {video_id}")
+                        return result
                 except Exception:
-                    continue
+                    continue  # this one failed, try the next
 
-            for t in all_transcripts:
+            # ── Strategy 3: raw fallback (non-English) — last resort ──
+            # Only reached if ALL translation attempts failed.
+            # Gemini can still summarise non-English text reasonably well.
+            for t in ordered:
                 try:
-                    print(f"Raw {t.language_code} fallback for {video_id}")
-                    return _snippets_to_dicts(t.fetch())
+                    raw = t.fetch()
+                    result = _snippets_to_dicts(raw)
+                    if result:
+                        print(f"Raw {t.language_code} fallback for {video_id} (translation unavailable)")
+                        return result
                 except Exception:
                     continue
 
@@ -354,7 +373,7 @@ def summarize_transcript(title: str, full_text: str, model_name: str, gemini_key
     if len(full_text) > max_chars:
         text_to_summarize += "\n\n[Transcript truncated for summarization]"
 
-    prompt = f"""You are an expert content analyst. Summarize the following YouTube video transcript into a clear, well-structured summary.
+    prompt = f"""You are an expert content analyst. Summarize the following YouTube video transcript into a clear, well-structured summary. Always respond in English regardless of the transcript language.
 
 Video Title: "{title}"
 
