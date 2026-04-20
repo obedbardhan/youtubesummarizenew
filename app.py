@@ -78,67 +78,74 @@ def fetch_video_metadata(video_id: str) -> dict:
 
 def _try_fetch_transcript(video_id: str, cookie_file: str = None) -> Optional[list]:
     """
-    Fetch transcript and return it in English, trying every available strategy:
+    Fetch transcript using youtube-transcript-api v1.0+ instance API.
 
-    1. Native English transcript (manually created or auto-generated).
-    2. Any manually-created transcript translated to English.
-    3. Any auto-generated transcript translated to English.
-       — Auto-generated captions on non-English videos (e.g. Hindi, Spanish)
-         are only exposed via translate(), not find_transcript(['en']).
-         We must iterate ALL transcripts and try each one individually,
-         because is_translatable can be misleadingly False until accessed.
-    4. Direct fetch of any transcript as a last resort (untranslated),
-       so the caller still gets something rather than nothing.
+    v1.0 breaking change: static methods removed.
+    New API: YouTubeTranscriptApi().list(video_id) and .fetch(video_id, languages=[...])
+
+    Strategies:
+    1. Direct fetch with English language preference (fastest path)
+    2. List all transcripts, try translating each to English
+    3. Fetch raw (non-English) as last resort
     """
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, cookies=cookie_file)
-        all_transcripts = list(transcript_list)  # materialise once
+        api = YouTubeTranscriptApi()
+        proxies = None  # Add proxy config here if needed later
 
-        if not all_transcripts:
-            return None
-
-        # ── Strategy 1: native English ────────────────────────────────
+        # ── Strategy 1: direct fetch preferring English variants ──────
         en_codes = ['en', 'en-US', 'en-GB', 'en-IN', 'en-AU', 'en-CA']
-        for t in all_transcripts:
-            if t.language_code in en_codes:
+        try:
+            fetched = api.fetch(video_id, languages=en_codes)
+            # v1.0 returns a FetchedTranscript object; convert to list of dicts
+            return [{"text": s.text, "start": s.start, "duration": s.duration}
+                    for s in fetched.snippets]
+        except Exception:
+            pass  # No English transcript — try translation
+
+        # ── Strategy 2: list all, translate each to English ───────────
+        try:
+            transcript_list = api.list(video_id)
+            all_transcripts = list(transcript_list)
+
+            # Try manual transcripts first, then auto-generated
+            ordered = sorted(all_transcripts, key=lambda t: t.is_generated)
+            for t in ordered:
                 try:
-                    return t.fetch()
+                    translated = t.translate("en").fetch()
+                    return [{"text": s.text, "start": s.start, "duration": s.duration}
+                            for s in translated.snippets]
                 except Exception:
-                    pass
+                    continue
 
-        # ── Strategy 2 & 3: translate any transcript to English ────────
-        # Try manually-created first, then auto-generated (usually better
-        # quality for translation).
-        ordered = sorted(all_transcripts, key=lambda t: t.is_generated)  # manual first
-        for t in ordered:
-            try:
-                return t.translate('en').fetch()
-            except Exception:
-                continue  # this transcript isn't translatable — try the next
+            # ── Strategy 3: fetch any raw transcript ──────────────────
+            for t in all_transcripts:
+                try:
+                    print(f"Falling back to raw {t.language_code} for {video_id}")
+                    raw = t.fetch()
+                    return [{"text": s.text, "start": s.start, "duration": s.duration}
+                            for s in raw.snippets]
+                except Exception:
+                    continue
 
-        # ── Strategy 4: fetch raw (non-English) as last resort ─────────
-        for t in all_transcripts:
-            try:
-                print(f"⚠️  Falling back to raw {t.language_code} transcript for {video_id}")
-                return t.fetch()
-            except Exception:
-                continue
+        except Exception as e:
+            print(f"Transcript list error for {video_id}: {type(e).__name__}: {e}")
 
     except Exception as e:
         print(f"Transcript fetch error for {video_id}: {type(e).__name__}: {e}")
 
     return None
 
-def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None) -> Optional[list]:
+def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None):
     """
-    Fetch transcript via Supadata API with full support for:
+    Fetch transcript via Supadata API.
+    Returns (segments_list, None) on success, or (None, error_string) on failure.
     - Immediate response (HTTP 200): segments returned directly
     - Async job response (HTTP 202): poll /youtube/transcript/{jobId} until done
     - Correct unit conversion: Supadata returns offset/duration in MILLISECONDS
     """
     api_key = provided_key or os.environ.get("SUPADATA_API_KEY")
     if not api_key:
-        return None
+        return None, "no_api_key"
 
     base = "https://api.supadata.ai/v1"
     headers = {"x-api-key": api_key}
@@ -173,7 +180,8 @@ def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None) -> O
 
         # ── Immediate result ──────────────────────────────────────────
         if resp.status_code == 200:
-            return _parse_segments(resp.json())
+            segs = _parse_segments(resp.json())
+        return (segs, None) if segs else (None, f"200_but_empty_content")
 
         # ── Async job issued ──────────────────────────────────────────
         if resp.status_code == 202:
@@ -192,22 +200,27 @@ def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None) -> O
                     segments = _parse_segments(poll.json())
                     if segments:
                         print(f"Supadata: job {job_id} complete after {attempt + 1} polls")
-                        return segments
+                        return segments, None
                 elif poll.status_code == 202:
                     continue  # still processing
                 else:
-                    print(f"Supadata poll error {poll.status_code}: {poll.text[:200]}")
-                    break
+                    err = f"poll_{poll.status_code}: {poll.text[:200]}"
+                    print(f"Supadata poll error: {err}")
+                    return None, err
 
-            print(f"Supadata: job {job_id} timed out after polling")
-            return None
+            msg = f"job_{job_id}_timed_out"
+            print(f"Supadata: {msg}")
+            return None, msg
 
-        print(f"Supadata: unexpected status {resp.status_code}: {resp.text[:200]}")
+        err = f"status_{resp.status_code}: {resp.text[:300]}"
+        print(f"Supadata unexpected: {err}")
+        return None, err
 
     except Exception as e:
-        print(f"Supadata fetch failed for {video_id}: {e}")
+        print(f"Supadata exception for {video_id}: {e}")
+        return None, str(e)
 
-    return None
+    return None, "unknown"
 
 def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
     """
@@ -236,32 +249,34 @@ def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
         return _format_transcript(fetched, debug_info)
 
     debug_info["tier1"] = "failed"
-    print(f"⚠️  Tier 1 failed for {video_id}, trying Supadata…")
+    print(f"Tier 1 failed for {video_id}, trying Supadata...")
 
     # ── Tier 2: Supadata ──────────────────────────────────────────────
-    active_supadata_key = supadata_key or os.environ.get("SUPADATA_API_KEY")
+    # Always prefer env var so it works even if frontend never sent the key
+    env_key = os.environ.get("SUPADATA_API_KEY", "").strip()
+    active_supadata_key = supadata_key.strip() if supadata_key else env_key or None
+    debug_info["supadata_key_source"] = (
+        "frontend" if (supadata_key and supadata_key.strip()) else ("env" if env_key else "none")
+    )
+    debug_info["supadata_key_present"] = bool(active_supadata_key)
+
     if active_supadata_key:
-        try:
-            fetched_supa = _try_supadata_fetch_transcript(video_id, provided_key=active_supadata_key)
-            if fetched_supa:
-                debug_info["method"] = "supadata"
-                return _format_transcript(fetched_supa, debug_info)
-            else:
-                debug_info["tier2"] = "returned_empty"
-        except Exception as e:
-            debug_info["tier2_error"] = str(e)
+        fetched_supa, supa_error = _try_supadata_fetch_transcript(
+            video_id, provided_key=active_supadata_key
+        )
+        if fetched_supa:
+            debug_info["method"] = "supadata"
+            return _format_transcript(fetched_supa, debug_info)
+        else:
+            debug_info["tier2"] = f"failed: {supa_error}"
     else:
         debug_info["tier2"] = "no_supadata_key"
 
-    # Always log full debug info so it appears in Render logs
-    print(f"❌ All transcript methods failed for {video_id}. debug={debug_info}")
+    print(f"All transcript methods failed for {video_id}. debug={debug_info}")
 
+    tier2_detail = debug_info.get("tier2", "unknown error")
     return {
-        "error": (
-            "Could not fetch transcript. "
-            "The video may lack captions, or the server IP is blocked by YouTube. "
-            "Adding a Supadata API key in Settings usually fixes cloud deployment issues."
-        ),
+        "error": f"Transcript fetch failed. Reason: {tier2_detail}",
         "segments": [],
         "full_text": "",
         "debug": debug_info,
@@ -453,10 +468,11 @@ def debug_transcript():
 
     report = {"video_id": video_id, "steps": {}}
 
-    # Step 1: youtube_transcript_api
+    # Step 1: youtube_transcript_api (v1.0+ instance API)
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
-        tlist = YouTubeTranscriptApi.list_transcripts(video_id)
+        api = YouTubeTranscriptApi()
+        tlist = api.list(video_id)
         langs = [{"code": t.language_code, "generated": t.is_generated,
                   "translatable": t.is_translatable} for t in tlist]
         report["steps"]["yt_list"] = {"status": "ok", "langs": langs}
