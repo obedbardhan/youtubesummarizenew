@@ -130,32 +130,83 @@ def _try_fetch_transcript(video_id: str, cookie_file: str = None) -> Optional[li
     return None
 
 def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None) -> Optional[list]:
-    """Fallback: Fetch transcript using Supadata API."""
+    """
+    Fetch transcript via Supadata API with full support for:
+    - Immediate response (HTTP 200): segments returned directly
+    - Async job response (HTTP 202): poll /youtube/transcript/{jobId} until done
+    - Correct unit conversion: Supadata returns offset/duration in MILLISECONDS
+    """
     api_key = provided_key or os.environ.get("SUPADATA_API_KEY")
     if not api_key:
         return None
 
+    base = "https://api.supadata.ai/v1"
+    headers = {"x-api-key": api_key}
+
+    def _parse_segments(data: dict) -> Optional[list]:
+        """Convert Supadata response dict into normalised segment list."""
+        segments = data.get("content") or []
+        if not segments or not isinstance(segments, list):
+            return None
+        result = []
+        for s in segments:
+            text = s.get("text") or s.get("content") or ""
+            if not text:
+                continue
+            # Supadata uses 'offset' in milliseconds; convert to seconds
+            offset_ms = s.get("offset") or s.get("start") or 0
+            duration_ms = s.get("duration") or 0
+            result.append({
+                "start":    float(offset_ms) / 1000.0,
+                "duration": float(duration_ms) / 1000.0,
+                "text":     text,
+            })
+        return result if result else None
+
     try:
-        url = f"https://api.supadata.ai/v1/youtube/transcript?videoId={video_id}&lang=en"
-        headers = {"x-api-key": api_key}
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(
+            f"{base}/youtube/transcript",
+            params={"videoId": video_id, "lang": "en"},
+            headers=headers,
+            timeout=15,
+        )
 
+        # ── Immediate result ──────────────────────────────────────────
         if resp.status_code == 200:
-            data = resp.json()
-            segments = data.get("content") or data.get("transcript") or []
-            if not segments and isinstance(data, list):
-                segments = data
+            return _parse_segments(resp.json())
 
-            if not segments:
+        # ── Async job issued ──────────────────────────────────────────
+        if resp.status_code == 202:
+            job_id = resp.json().get("jobId")
+            if not job_id:
+                print("Supadata: got 202 but no jobId in response")
                 return None
 
-            return [{
-                "start": float(s.get("start") if s.get("start") is not None else s.get("offset", 0)),
-                "duration": float(s.get("duration") if s.get("duration") is not None else s.get("duration", 0)),
-                "text": s.get("text") or s.get("content", "")
-            } for s in segments if s.get("text") or s.get("content")]
+            print(f"Supadata: async job started ({job_id}), polling…")
+            poll_url = f"{base}/youtube/transcript/{job_id}"
+            # Poll up to ~5 minutes (60 × 5 s) — sufficient for 2-hour videos
+            for attempt in range(60):
+                time.sleep(5)
+                poll = requests.get(poll_url, headers=headers, timeout=15)
+                if poll.status_code == 200:
+                    segments = _parse_segments(poll.json())
+                    if segments:
+                        print(f"Supadata: job {job_id} complete after {attempt + 1} polls")
+                        return segments
+                elif poll.status_code == 202:
+                    continue  # still processing
+                else:
+                    print(f"Supadata poll error {poll.status_code}: {poll.text[:200]}")
+                    break
+
+            print(f"Supadata: job {job_id} timed out after polling")
+            return None
+
+        print(f"Supadata: unexpected status {resp.status_code}: {resp.text[:200]}")
+
     except Exception as e:
         print(f"Supadata fetch failed for {video_id}: {e}")
+
     return None
 
 def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
@@ -554,11 +605,15 @@ def summarize_stream():
         def generate():
             import json as _json
 
-            # Phase 1 — sequential transcript fetching (YouTube blocks parallel)
+            # Phase 1 — sequential transcript fetching
+            # Send a heartbeat comment every iteration so the SSE connection
+            # stays alive through Render's idle-connection timeout (even when
+            # Supadata is polling for minutes on a long video).
             fetched_videos = []
             for i, task in enumerate(tasks):
+                yield ": heartbeat\n\n"   # SSE comment — keeps connection alive
+
                 if task["video_id"] is None:
-                    # Immediately stream an error result for bad URLs
                     err_result = {
                         "url": task["url"],
                         "error": f"Could not extract video ID from: {task['url']}",
@@ -581,7 +636,8 @@ def summarize_stream():
                     }
                     yield f"data: {_json.dumps({'type': 'result', 'data': err_result})}\n\n"
 
-                # Polite delay between YouTube requests
+                # Small delay between YouTube requests to avoid IP blocks.
+                # Skip after last task.
                 if i < len(tasks) - 1:
                     time.sleep(1.5)
 
