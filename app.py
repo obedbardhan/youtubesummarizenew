@@ -39,13 +39,16 @@ _retry_lock = threading.Lock()
 from typing import Optional
 
 def extract_video_id(url: str) -> Optional[str]:
-    """Extract the YouTube video ID from various URL formats."""
+    """Extract the YouTube video ID from any known URL format."""
     url = url.strip()
+    # Strip referral / tracking params that appear before the ID in some share URLs
     patterns = [
-        r"(?:v=|/v/)([\w-]{11})",
-        r"youtu\.be/([\w-]{11})",
-        r"(?:embed/|shorts/)([\w-]{11})",
-        r"^([\w-]{11})$",
+        r"[?&]v=([\w-]{11})",          # ?v=ID or &v=ID  (standard watch URLs)
+        r"youtu\.be/([\w-]{11})",       # youtu.be/ID
+        r"/(?:embed|v)/([\w-]{11})",    # /embed/ID  /v/ID
+        r"/shorts/([\w-]{11})",         # /shorts/ID
+        r"/live/([\w-]{11})",           # /live/ID  (live streams)
+        r"^([\w-]{11})$",               # bare 11-char ID
     ]
     for pattern in patterns:
         match = re.search(pattern, url)
@@ -74,23 +77,55 @@ def fetch_video_metadata(video_id: str) -> dict:
     }
 
 def _try_fetch_transcript(video_id: str, cookie_file: str = None) -> Optional[list]:
-    """Attempt to fetch transcript, strictly forcing English natively or via translation."""
+    """
+    Fetch transcript and return it in English, trying every available strategy:
+
+    1. Native English transcript (manually created or auto-generated).
+    2. Any manually-created transcript translated to English.
+    3. Any auto-generated transcript translated to English.
+       — Auto-generated captions on non-English videos (e.g. Hindi, Spanish)
+         are only exposed via translate(), not find_transcript(['en']).
+         We must iterate ALL transcripts and try each one individually,
+         because is_translatable can be misleadingly False until accessed.
+    4. Direct fetch of any transcript as a last resort (untranslated),
+       so the caller still gets something rather than nothing.
+    """
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, cookies=cookie_file)
+        all_transcripts = list(transcript_list)  # materialise once
 
-        try:
-            en_transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB', 'en-IN'])
-            return en_transcript.fetch()
-        except Exception:
-            pass  # Move to translation phase
+        if not all_transcripts:
+            return None
 
-        for transcript in transcript_list:
-            if transcript.is_translatable:
-                translated = transcript.translate('en')
-                return translated.fetch()
+        # ── Strategy 1: native English ────────────────────────────────
+        en_codes = ['en', 'en-US', 'en-GB', 'en-IN', 'en-AU', 'en-CA']
+        for t in all_transcripts:
+            if t.language_code in en_codes:
+                try:
+                    return t.fetch()
+                except Exception:
+                    pass
+
+        # ── Strategy 2 & 3: translate any transcript to English ────────
+        # Try manually-created first, then auto-generated (usually better
+        # quality for translation).
+        ordered = sorted(all_transcripts, key=lambda t: t.is_generated)  # manual first
+        for t in ordered:
+            try:
+                return t.translate('en').fetch()
+            except Exception:
+                continue  # this transcript isn't translatable — try the next
+
+        # ── Strategy 4: fetch raw (non-English) as last resort ─────────
+        for t in all_transcripts:
+            try:
+                print(f"⚠️  Falling back to raw {t.language_code} transcript for {video_id}")
+                return t.fetch()
+            except Exception:
+                continue
 
     except Exception as e:
-        print(f"Transcript fetch error for {video_id}: {e}")
+        print(f"Transcript fetch error for {video_id}: {type(e).__name__}: {e}")
 
     return None
 
@@ -124,7 +159,15 @@ def _try_supadata_fetch_transcript(video_id: str, provided_key: str = None) -> O
     return None
 
 def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
-    """Fetch transcript prioritizing native translation."""
+    """
+    Fetch transcript with two-tier fallback:
+    Tier 1 — youtube_transcript_api (works locally and on uncapped IPs)
+    Tier 2 — Supadata API (reliable on cloud/Render IPs that YouTube blocks)
+
+    On Render, YouTube frequently returns 429 / IP-blocked errors.
+    We always attempt Tier 1 first, but fall through to Supadata quickly
+    if it fails — regardless of *why* it failed.
+    """
     debug_info = {}
     cookie_file = None
     render_cookie_path = "/etc/secrets/cookies.txt"
@@ -135,23 +178,36 @@ def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
     elif os.path.exists(local_cookie_path):
         cookie_file = local_cookie_path
 
+    # ── Tier 1 ────────────────────────────────────────────────────────
     fetched = _try_fetch_transcript(video_id, cookie_file)
     if fetched:
-        debug_info["method"] = "youtube_transcript_api_translated"
+        debug_info["method"] = "youtube_transcript_api"
         return _format_transcript(fetched, debug_info)
 
-    try:
-        active_supadata_key = supadata_key or os.environ.get("SUPADATA_API_KEY")
-        if active_supadata_key:
+    debug_info["tier1"] = "failed"
+    print(f"⚠️  Tier 1 failed for {video_id}, trying Supadata…")
+
+    # ── Tier 2: Supadata ──────────────────────────────────────────────
+    active_supadata_key = supadata_key or os.environ.get("SUPADATA_API_KEY")
+    if active_supadata_key:
+        try:
             fetched_supa = _try_supadata_fetch_transcript(video_id, provided_key=active_supadata_key)
             if fetched_supa:
                 debug_info["method"] = "supadata"
                 return _format_transcript(fetched_supa, debug_info)
-    except Exception as e:
-        debug_info["tier2_error"] = str(e)
+            else:
+                debug_info["tier2"] = "returned_empty"
+        except Exception as e:
+            debug_info["tier2_error"] = str(e)
+    else:
+        debug_info["tier2"] = "no_supadata_key"
 
     return {
-        "error": "Could not extract or translate transcript. Video might lack captions.",
+        "error": (
+            "Could not fetch transcript. "
+            "The video may lack captions, or the server IP is blocked by YouTube. "
+            "Adding a Supadata API key in Settings usually fixes cloud deployment issues."
+        ),
         "segments": [],
         "full_text": "",
         "debug": debug_info,
@@ -573,6 +629,7 @@ def summarize_stream():
 
 
 
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8082))
     is_dev = "--dev" in sys.argv or os.environ.get("FLASK_ENV") == "development"
     print(f"🎬 YouTubeSummarizer server starting on http://localhost:{port}")
