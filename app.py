@@ -253,6 +253,9 @@ def fetch_transcript(video_id: str, supadata_key: str = None) -> dict:
     else:
         debug_info["tier2"] = "no_supadata_key"
 
+    # Always log full debug info so it appears in Render logs
+    print(f"❌ All transcript methods failed for {video_id}. debug={debug_info}")
+
     return {
         "error": (
             "Could not fetch transcript. "
@@ -436,6 +439,61 @@ def index():
 def health_check():
     from datetime import datetime, timezone
     return jsonify({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
+
+@app.route("/api/debug-transcript", methods=["GET"])
+def debug_transcript():
+    """
+    Diagnostic endpoint — call this to see exactly what transcript methods
+    succeed or fail for a given video on this server.
+    Usage: /api/debug-transcript?video_id=UYdbJDKvCEM
+    """
+    video_id = request.args.get("video_id", "").strip()
+    if not video_id:
+        return jsonify({"error": "Pass ?video_id=VIDEO_ID"}), 400
+
+    report = {"video_id": video_id, "steps": {}}
+
+    # Step 1: youtube_transcript_api
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        tlist = YouTubeTranscriptApi.list_transcripts(video_id)
+        langs = [{"code": t.language_code, "generated": t.is_generated,
+                  "translatable": t.is_translatable} for t in tlist]
+        report["steps"]["yt_list"] = {"status": "ok", "langs": langs}
+    except Exception as e:
+        report["steps"]["yt_list"] = {"status": "error", "error": str(e)}
+
+    # Step 2: Try _try_fetch_transcript
+    try:
+        result = _try_fetch_transcript(video_id)
+        if result:
+            report["steps"]["yt_fetch"] = {"status": "ok", "segments": len(result)}
+        else:
+            report["steps"]["yt_fetch"] = {"status": "returned_none"}
+    except Exception as e:
+        report["steps"]["yt_fetch"] = {"status": "error", "error": str(e)}
+
+    # Step 3: Supadata (env var key)
+    supa_key = os.environ.get("SUPADATA_API_KEY")
+    if supa_key:
+        try:
+            import requests as req
+            resp = req.get(
+                "https://api.supadata.ai/v1/youtube/transcript",
+                params={"videoId": video_id, "lang": "en"},
+                headers={"x-api-key": supa_key},
+                timeout=15,
+            )
+            report["steps"]["supadata"] = {
+                "status": resp.status_code,
+                "body_preview": resp.text[:300],
+            }
+        except Exception as e:
+            report["steps"]["supadata"] = {"status": "error", "error": str(e)}
+    else:
+        report["steps"]["supadata"] = {"status": "no_key_in_env"}
+
+    return jsonify(report)
 
 @app.route("/api/summarize", methods=["POST"])
 def summarize():
