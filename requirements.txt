@@ -3,3 +3,4 @@ flask-cors
 youtube-transcript-api>=1.0.0
 google-generativeai
 requests
+gunicorn
